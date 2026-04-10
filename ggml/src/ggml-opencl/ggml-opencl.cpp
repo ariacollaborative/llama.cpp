@@ -426,6 +426,10 @@ struct ggml_backend_opencl_context {
     cl_program program_gemv_noshuffle;
     cl_program program_get_rows;
     cl_program program_set_rows;
+    cl_program program_set_rows_tq3;
+    cl_program program_mul_mv_tq3_f32;
+    cl_mem tq3_signs_128, tq3_signs_256;
+    cl_mem tq3_s_transpose_128, tq3_s_transpose_256;
     cl_program program_glu;
     cl_program program_im2col_f16;
     cl_program program_im2col_f32;
@@ -516,6 +520,9 @@ struct ggml_backend_opencl_context {
     std::map<std::pair<int, int>, int>       kernels_flash_attn_bn;
     cl_kernel kernel_get_rows_f32, kernel_get_rows_f16, kernel_get_rows_q4_0;
     cl_kernel kernel_set_rows_f32_i64, kernel_set_rows_f32_i32, kernel_set_rows_f16_i64, kernel_set_rows_f16_i32;
+    cl_kernel kernel_set_rows_tq3_128_i64, kernel_set_rows_tq3_128_i32;
+    cl_kernel kernel_set_rows_tq3_256_i64, kernel_set_rows_tq3_256_i32;
+    cl_kernel kernel_mul_mv_tq3_128_f32, kernel_mul_mv_tq3_256_f32;
     cl_kernel kernel_rope_norm_f32, kernel_rope_norm_f16, kernel_rope_neox_f32, kernel_rope_neox_f16;
     cl_kernel kernel_rope_multi_f32, kernel_rope_multi_f16, kernel_rope_vision_f32, kernel_rope_vision_f16;
     cl_kernel kernel_cpy_f16_f16, kernel_cpy_f16_f32, kernel_cpy_f32_f16, kernel_cpy_f32_f32, kernel_cpy_i32_i32;
@@ -2268,6 +2275,62 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         GGML_LOG_CONT(".");
     }
 
+    // TQ3 kernels + constant buffers
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string sr_src {
+            #include "set_rows_tq3.cl.h"
+        };
+        const std::string mv_src {
+            #include "mul_mv_tq3_f32.cl.h"
+        };
+#else
+        const std::string sr_src = read_file("set_rows_tq3.cl");
+        const std::string mv_src = read_file("mul_mv_tq3_f32.cl");
+#endif
+        backend_ctx->program_set_rows_tq3 =
+            build_program_from_source(backend_ctx->context, backend_ctx->device, sr_src.c_str(), compile_opts);
+        CL_CHECK((backend_ctx->kernel_set_rows_tq3_128_i64 = clCreateKernel(backend_ctx->program_set_rows_tq3, "kernel_set_rows_tq3_128_i64", &err), err));
+        CL_CHECK((backend_ctx->kernel_set_rows_tq3_128_i32 = clCreateKernel(backend_ctx->program_set_rows_tq3, "kernel_set_rows_tq3_128_i32", &err), err));
+        CL_CHECK((backend_ctx->kernel_set_rows_tq3_256_i64 = clCreateKernel(backend_ctx->program_set_rows_tq3, "kernel_set_rows_tq3_256_i64", &err), err));
+        CL_CHECK((backend_ctx->kernel_set_rows_tq3_256_i32 = clCreateKernel(backend_ctx->program_set_rows_tq3, "kernel_set_rows_tq3_256_i32", &err), err));
+
+        backend_ctx->program_mul_mv_tq3_f32 =
+            build_program_from_source(backend_ctx->context, backend_ctx->device, mv_src.c_str(), compile_opts);
+        CL_CHECK((backend_ctx->kernel_mul_mv_tq3_128_f32 = clCreateKernel(backend_ctx->program_mul_mv_tq3_f32, "kernel_mul_mv_tq3_128_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_mul_mv_tq3_256_f32 = clCreateKernel(backend_ctx->program_mul_mv_tq3_f32, "kernel_mul_mv_tq3_256_f32", &err), err));
+
+        // Generate signs (seed=42) and S^T (seed=1042) buffers
+        auto xor64 = [](uint64_t s) -> uint64_t { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; };
+        auto gen_signs = [&](int N) {
+            std::vector<float> v(N);
+            uint64_t s = 42;
+            for (int j = 0; j < N; j++) { s = xor64(s); v[j] = (s & 1) ? 1.0f : -1.0f; }
+            return v;
+        };
+        auto gen_st = [&](int N) {
+            std::vector<float> S(N*N), ST(N*N);
+            uint64_t s = 1042;
+            for (int i = 0; i < N*N; i++) {
+                s = xor64(s); double u1 = (double)(s & 0xFFFFFFFFFFFFULL) / (double)0xFFFFFFFFFFFFULL;
+                s = xor64(s); double u2 = (double)(s & 0xFFFFFFFFFFFFULL) / (double)0xFFFFFFFFFFFFULL;
+                if (u1 < 1e-15) u1 = 1e-15;
+                S[i] = (float)(sqrt(-2.0 * log(u1)) * cos(6.283185307179586 * u2));
+            }
+            for (int r = 0; r < N; r++)
+                for (int c = 0; c < N; c++)
+                    ST[c*N + r] = S[r*N + c];
+            return ST;
+        };
+        auto s128 = gen_signs(128); auto st128 = gen_st(128);
+        auto s256 = gen_signs(256); auto st256 = gen_st(256);
+        backend_ctx->tq3_signs_128 = clCreateBuffer(backend_ctx->context, CL_MEM_READ_ONLY|CL_MEM_COPY_HOST_PTR, 128*sizeof(float), s128.data(), &err); CL_CHECK(err);
+        backend_ctx->tq3_s_transpose_128 = clCreateBuffer(backend_ctx->context, CL_MEM_READ_ONLY|CL_MEM_COPY_HOST_PTR, 128*128*sizeof(float), st128.data(), &err); CL_CHECK(err);
+        backend_ctx->tq3_signs_256 = clCreateBuffer(backend_ctx->context, CL_MEM_READ_ONLY|CL_MEM_COPY_HOST_PTR, 256*sizeof(float), s256.data(), &err); CL_CHECK(err);
+        backend_ctx->tq3_s_transpose_256 = clCreateBuffer(backend_ctx->context, CL_MEM_READ_ONLY|CL_MEM_COPY_HOST_PTR, 256*256*sizeof(float), st256.data(), &err); CL_CHECK(err);
+        GGML_LOG_CONT(".");
+    }
+
      // conv2d
      {
         #ifdef GGML_OPENCL_EMBED_KERNELS
@@ -3803,6 +3866,8 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 switch (op->type) {
                     case GGML_TYPE_F16:
                     case GGML_TYPE_F32:
+                    case GGML_TYPE_TQ3_128:
+                    case GGML_TYPE_TQ3_256:
                         return (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
                     default:
                         return false;
@@ -3948,6 +4013,8 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                        op->src[0]->type == GGML_TYPE_Q6_K) {
                 return op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
             } else if (op->src[0]->type == GGML_TYPE_Q8_0) {
+                return op->src[1]->type == GGML_TYPE_F32;
+            } else if (op->src[0]->type == GGML_TYPE_TQ3_128 || op->src[0]->type == GGML_TYPE_TQ3_256) {
                 return op->src[1]->type == GGML_TYPE_F32;
             }
             return false;
@@ -6399,6 +6466,16 @@ static void ggml_cl_set_rows(ggml_backend_t backend, const ggml_tensor * src0, c
                 kernel = backend_ctx->kernel_set_rows_f16_i32;
             }
             break;
+        case GGML_TYPE_TQ3_128:
+            kernel = (src1->type == GGML_TYPE_I64)
+                ? backend_ctx->kernel_set_rows_tq3_128_i64
+                : backend_ctx->kernel_set_rows_tq3_128_i32;
+            break;
+        case GGML_TYPE_TQ3_256:
+            kernel = (src1->type == GGML_TYPE_I64)
+                ? backend_ctx->kernel_set_rows_tq3_256_i64
+                : backend_ctx->kernel_set_rows_tq3_256_i32;
+            break;
         default:
             GGML_ABORT("not implemented");
     }
@@ -6425,6 +6502,15 @@ static void ggml_cl_set_rows(ggml_backend_t backend, const ggml_tensor * src0, c
     CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_ulong), &nb1));
     CL_CHECK(clSetKernelArg(kernel, 17, sizeof(cl_ulong), &nb2));
     CL_CHECK(clSetKernelArg(kernel, 18, sizeof(cl_ulong), &nb3));
+
+    // TQ3 kernels need signs + S^T buffer args
+    if (dst->type == GGML_TYPE_TQ3_128) {
+        CL_CHECK(clSetKernelArg(kernel, 19, sizeof(cl_mem), &backend_ctx->tq3_signs_128));
+        CL_CHECK(clSetKernelArg(kernel, 20, sizeof(cl_mem), &backend_ctx->tq3_s_transpose_128));
+    } else if (dst->type == GGML_TYPE_TQ3_256) {
+        CL_CHECK(clSetKernelArg(kernel, 19, sizeof(cl_mem), &backend_ctx->tq3_signs_256));
+        CL_CHECK(clSetKernelArg(kernel, 20, sizeof(cl_mem), &backend_ctx->tq3_s_transpose_256));
+    }
 
     int nth0 = 64;
     if (backend_ctx->gpu_family == INTEL) {
@@ -10962,6 +11048,41 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0), (size_t)(CEIL_DIV(ne11, 64)), (size_t)ne12*ne13};
                 size_t local_work_size[] = {(size_t)nth0, 1, 1};
 
+                backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+                return;
+            }
+            case GGML_TYPE_TQ3_128:
+            case GGML_TYPE_TQ3_256: {
+                kernel = (src0t == GGML_TYPE_TQ3_128)
+                    ? backend_ctx->kernel_mul_mv_tq3_128_f32
+                    : backend_ctx->kernel_mul_mv_tq3_256_f32;
+                nth0 = 1;
+
+                CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
+                CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
+                CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra1->data_device));
+                CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
+                CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extrad->data_device));
+                CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offsetd));
+                CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &ne00));
+                CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &ne01));
+                CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne02));
+                CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &ne10));
+                CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &ne12));
+                CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &ne0));
+                CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &ne1));
+                CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &r2));
+                CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &r3));
+                if (src0t == GGML_TYPE_TQ3_128) {
+                    CL_CHECK(clSetKernelArg(kernel, 15, sizeof(cl_mem), &backend_ctx->tq3_signs_128));
+                    CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_mem), &backend_ctx->tq3_s_transpose_128));
+                } else {
+                    CL_CHECK(clSetKernelArg(kernel, 15, sizeof(cl_mem), &backend_ctx->tq3_signs_256));
+                    CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_mem), &backend_ctx->tq3_s_transpose_256));
+                }
+
+                size_t global_work_size[] = {(size_t)ne01, (size_t)ne12*ne13, 1};
+                size_t local_work_size[] = {1, 1, 1};
                 backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
                 return;
             }
