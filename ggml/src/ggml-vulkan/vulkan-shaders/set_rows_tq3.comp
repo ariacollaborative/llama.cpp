@@ -1,0 +1,156 @@
+#version 450
+
+#include "types.glsl"
+
+layout(constant_id = 0) const uint TQ3_N = 128;
+layout(constant_id = 1) const uint IDX64 = 0;  // 0=i32, 1=i64
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0, std430) readonly buffer SrcData { float src_data[]; };
+layout(binding = 1, std430) readonly buffer IdxData { uint idx_data[]; };  // read as uint pairs for i64
+layout(binding = 2, std430) buffer DstData { uint dst_data[]; };
+layout(binding = 3, std430) readonly buffer SMatrix { float ST[]; };
+layout(binding = 4, std430) readonly buffer Signs { float signs[]; };
+
+layout(push_constant) uniform PC {
+    uint n_blocks;
+    uint src_stride;
+    uint dst_stride;
+};
+
+const float codebook[4] = float[4](-0.13304020, -0.03999094, 0.03999094, 0.13304020);
+const float boundaries[3] = float[3](-0.08651557, 0.0, 0.08651557);
+
+shared float smem[TQ3_N];
+shared float smem2[TQ3_N];
+// No uint shared array — Turnip hangs with >2048 bytes shared memory
+// Store uint values as float(val+1) to avoid denorm flushing (0→1.0, 1→2.0, etc)
+
+void main() {
+    uint block_idx = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (block_idx >= n_blocks) return;
+
+    uint block_words = (3u * TQ3_N / 8u + 4u) / 4u;
+    uint blocks_per_row = dst_stride;  // passed via push constants
+    uint src_row = block_idx / blocks_per_row;
+    uint block_in_row = block_idx % blocks_per_row;
+    uint dst_row = (IDX64 != 0u) ? idx_data[src_row * 2u] : idx_data[src_row];
+    uint src_base = block_idx * TQ3_N;
+    uint dst_base = dst_row * blocks_per_row * block_words + block_in_row * block_words;
+
+    // --- Load source, compute norm via parallel reduction ---
+    float val = src_data[src_base + tid];
+    smem[tid] = val;
+    smem2[tid] = val * val;
+    barrier();
+
+    for (uint s = TQ3_N / 2u; s > 0u; s >>= 1u) {
+        if (tid < s) smem2[tid] += smem2[tid + s];
+        barrier();
+    }
+    float norm = sqrt(smem2[0]);
+
+    if (norm < 1e-10) {
+        if (tid < block_words) dst_data[dst_base + tid] = 0u;
+        return;
+    }
+
+    // --- Normalize and apply signs ---
+    float inv_norm = 1.0 / norm;
+    smem[tid] = smem[tid] * inv_norm * signs[tid];
+    barrier();
+
+    // --- FWHT ---
+    for (uint h = 1u; h < TQ3_N; h <<= 1u) {
+        barrier();
+        uint group = tid / h;
+        uint pos = tid % h;
+        uint lo = group * (h * 2u) + pos;
+        uint hi = lo + h;
+        float a = 0.0, b = 0.0;
+        if (hi < TQ3_N) { a = smem[lo]; b = smem[hi]; }
+        barrier();
+        if (hi < TQ3_N) { smem[lo] = a + b; smem[hi] = a - b; }
+    }
+    barrier();
+    smem[tid] *= inversesqrt(float(TQ3_N));
+    barrier();
+
+    // --- Lloyd-Max 2-bit quantize ---
+    float rotated = smem[tid];
+    uint q = (rotated > boundaries[2]) ? 3u :
+             (rotated > boundaries[1]) ? 2u :
+             (rotated > boundaries[0]) ? 1u : 0u;
+    float deq = codebook[q];
+
+    // Store index for cooperative packing
+    smem[tid] = float(q + 1u);
+    barrier();
+
+    // --- Pack 2-bit indices: 16 per uint32 ---
+    if (tid < TQ3_N / 16u) {
+        uint word = 0u;
+        for (uint k = 0u; k < 16u; k++) {
+            word |= (uint(smem[tid * 16u + k]) - 1u) << (k * 2u);
+        }
+        dst_data[dst_base + tid] = word;
+    }
+    barrier();
+
+    // --- Unrotate for residual ---
+    smem[tid] = deq;
+    barrier();
+    for (uint h = 1u; h < TQ3_N; h <<= 1u) {
+        barrier();
+        uint group = tid / h;
+        uint pos = tid % h;
+        uint lo = group * (h * 2u) + pos;
+        uint hi = lo + h;
+        float a = 0.0, b = 0.0;
+        if (hi < TQ3_N) { a = smem[lo]; b = smem[hi]; }
+        barrier();
+        if (hi < TQ3_N) { smem[lo] = a + b; smem[hi] = a - b; }
+    }
+    barrier();
+    smem[tid] *= inversesqrt(float(TQ3_N)) * signs[tid];
+    barrier();
+
+    float x_unit = src_data[src_base + tid] * inv_norm;
+    float residual = x_unit - smem[tid];
+
+    // --- Residual norm ---
+    smem2[tid] = residual * residual;
+    barrier();
+    for (uint s = TQ3_N / 2u; s > 0u; s >>= 1u) {
+        if (tid < s) smem2[tid] += smem2[tid + s];
+        barrier();
+    }
+    float res_norm = sqrt(smem2[0]);
+
+    // --- QJL projection ---
+    smem[tid] = residual;
+    barrier();
+
+    float proj = 0.0;
+    for (uint l = 0u; l < TQ3_N; l++) {
+        proj += ST[l * TQ3_N + tid] * smem[l];
+    }
+    smem[tid] = (proj >= 0.0) ? 2.0 : 1.0;
+    barrier();
+
+    // --- Pack QJL bits: 32 per uint32 ---
+    uint qjl_word_offset = TQ3_N / 16u;
+    if (tid < TQ3_N / 32u) {
+        uint word = 0u;
+        for (uint k = 0u; k < 32u; k++) {
+            word |= (uint(smem[tid * 32u + k]) - 1u) << k;
+        }
+        dst_data[dst_base + qjl_word_offset + tid] = word;
+    }
+
+    // --- Write norms ---
+    if (tid == 0u) {
+        dst_data[dst_base + 3u * TQ3_N / 32u] = packHalf2x16(vec2(norm, res_norm));
+    }
+}

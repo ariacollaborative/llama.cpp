@@ -1,0 +1,137 @@
+#version 450
+#include "types.glsl"
+
+// TQ3 DMMV v2: Cooperative FWHT query rotation on GPU
+// TQ3_N threads per workgroup, one key per workgroup
+// 5 bindings: keys, query_f32, output, S^T, signs
+
+layout(constant_id = 0) const uint TQ3_N = 128;
+layout(local_size_x_id = 0) in;
+
+layout(binding = 0, std430) readonly buffer KeyData { uint key_data[]; };
+layout(binding = 1, std430) readonly buffer QueryData { float query_data[]; };
+layout(binding = 2, std430) writeonly buffer Output { float result[]; };
+layout(binding = 3, std430) readonly buffer STranspose { float ST[]; };
+layout(binding = 4, std430) readonly buffer Signs { float signs[]; };
+
+layout(push_constant) uniform PC {
+    uint ncols;
+    uint stride_d;
+    uint batch_stride_a;
+    uint batch_stride_b;
+    uint batch_stride_d;
+    uint base_work_group_y;
+    uint ne02;
+    uint ne12;
+    uint broadcast2;
+    uint broadcast3;
+};
+
+const float codebook[4] = float[4](-0.13304020, -0.03999094, 0.03999094, 0.13304020);
+const float QJL_SCALE_FACTOR = 1.2533141;  // sqrt(pi/2)
+
+shared float smem[TQ3_N];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint my_key = gl_WorkGroupID.x;
+    if (my_key >= stride_d) return;
+
+    uint batch_idx = gl_WorkGroupID.y + base_work_group_y;
+    uint batch_idx_a = 0;
+    if (batch_idx != 0u) {
+        uint i13 = batch_idx / ne12;
+        uint i12 = batch_idx % ne12;
+        batch_idx_a = (i13 / broadcast3) * ne02 + (i12 / broadcast2);
+    }
+    uint a_offset = batch_idx_a * batch_stride_a;
+    uint b_offset = batch_idx * batch_stride_b;
+    uint d_offset = batch_idx * batch_stride_d;
+
+    uint num_blocks = ncols / TQ3_N;
+    uint block_bytes = 3u * TQ3_N / 8u + 4u;
+    uint block_words = (block_bytes + 3u) / 4u;
+
+    float total = 0.0;
+
+    for (uint block = 0u; block < num_blocks; block++) {
+        // Load raw query into shared memory
+        float raw_q = query_data[b_offset + block * TQ3_N + tid];
+        smem[tid] = raw_q;
+        barrier();
+
+        // S·q projection: each thread computes one element
+        float q_proj = 0.0;
+        for (uint l = 0u; l < TQ3_N; l++) {
+            q_proj += ST[l * TQ3_N + tid] * smem[l];
+        }
+        barrier();
+
+        // Apply signs for FWHT
+        smem[tid] = raw_q * signs[tid];
+        barrier();
+
+        // FWHT with one-thread-per-pair ownership (N/2 active threads per stage)
+        for (uint h = 1u; h < TQ3_N; h <<= 1u) {
+            float a = 0.0, b = 0.0;
+            uint lo = 0u, hi = 0u;
+            if (tid < TQ3_N / 2u) {
+                uint grp = tid / h;
+                uint j = tid % h;
+                lo = grp * 2u * h + j;
+                hi = lo + h;
+                a = smem[lo]; b = smem[hi];
+            }
+            barrier();
+            if (tid < TQ3_N / 2u) {
+                smem[lo] = a + b;
+                smem[hi] = a - b;
+            }
+            barrier();
+        }
+
+        smem[tid] *= inversesqrt(float(TQ3_N));
+        float q_rot = smem[tid];
+
+        // Dot product with key block
+        uint row_block_offset = a_offset + my_key * num_blocks * block_words + block * block_words;
+
+        uint norm_word_idx = row_block_offset + (3u * TQ3_N / 8u) / 4u;
+        uint meta_word = key_data[norm_word_idx];
+        float norm = unpackHalf2x16(meta_word & 0xFFFFu).x;
+        float resnorm = unpackHalf2x16(meta_word >> 16u).x;
+
+        // MSE: 2-bit codebook
+        uint idx_byte_offset = row_block_offset * 4u + tid / 4u;
+        uint idx_word = idx_byte_offset / 4u;
+        uint idx_byte_in_word = idx_byte_offset % 4u;
+        uint idx_raw = (key_data[idx_word] >> (idx_byte_in_word * 8u)) & 0xFFu;
+        uint idx2 = (idx_raw >> ((tid % 4u) * 2u)) & 3u;
+        float mse_partial = codebook[idx2] * q_rot;
+
+        // QJL: 1-bit sign
+        uint qjl_byte_offset = row_block_offset * 4u + TQ3_N / 4u + tid / 8u;
+        uint qjl_word = qjl_byte_offset / 4u;
+        uint qjl_byte_in_word = qjl_byte_offset % 4u;
+        uint qjl_raw = (key_data[qjl_word] >> (qjl_byte_in_word * 8u)) & 0xFFu;
+        float qjl_sign = ((qjl_raw >> (tid % 8u)) & 1u) != 0u ? 1.0 : -1.0;
+        float qjl_partial = qjl_sign * q_proj;
+
+        float qjl_scale = QJL_SCALE_FACTOR / float(TQ3_N);
+        float partial = norm * mse_partial + qjl_scale * norm * resnorm * qjl_partial;
+
+        // Tree reduction
+        smem[tid] = partial;
+        barrier();
+        for (uint s = TQ3_N / 2u; s > 0u; s >>= 1u) {
+            if (tid < s) smem[tid] += smem[tid + s];
+            barrier();
+        }
+        if (tid == 0u) total += smem[0];
+        barrier();
+    }
+
+    if (tid == 0u) {
+        result[d_offset + my_key] = total;
+    }
+}
