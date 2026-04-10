@@ -54,9 +54,8 @@ kernel void kernel_set_rows_tq3_##SUFFIX( \
     \
     if (get_local_id(0) >= nblk0) return; \
     \
-    /* Two reusable private buffers */ \
+    /* ONE private buffer — reused for every step */ \
     private float a[TQ3_N_VAL]; \
-    private float b[TQ3_N_VAL]; \
     \
     /* Step 1: Load and compute norm */ \
     float sum_sq = 0.0f; \
@@ -72,36 +71,38 @@ kernel void kernel_set_rows_tq3_##SUFFIX( \
     } \
     float inv_norm = 1.0f / norm; \
     \
-    /* Step 2: Normalize and apply signs -> a = x_unit_signed */ \
+    /* Step 2: Normalize and apply signs */ \
     for (int j = 0; j < TQ3_N; j++) \
         a[j] *= inv_norm * signs[j]; \
     \
     /* Step 3: FWHT in-place -> a = rotated */ \
     tq3_fwht(a, TQ3_N); \
     \
-    /* Step 4: Quantize from a[], pack idx to output, store codebook in b[] */ \
+    /* Step 4: Quantize from a[], pack idx to output */ \
     for (int j = 0; j < TQ3_N; j++) { \
         int q = (a[j] > tq3_boundaries[2]) ? 3 : \
                 (a[j] > tq3_boundaries[1]) ? 2 : \
                 (a[j] > tq3_boundaries[0]) ? 1 : 0; \
-        b[j] = tq3_codebook[q]; \
         int bp = j / 4, bs = (j % 4) * 2; \
         if (bs == 0) block_dst[bp] = (uchar)q; \
         else block_dst[bp] |= ((uchar)q << bs); \
     } \
     \
-    /* Step 5: Unrotate dequantized -> b = deq_unrot */ \
-    /* FWHT includes 1/sqrt(N). FWHT is its own inverse (unitary). */ \
-    /* Then multiply by signs to undo the sign application. */ \
-    tq3_fwht(b, TQ3_N); \
+    /* Step 5: Read back indices, reconstruct codebook values into a[] */ \
+    for (int j = 0; j < TQ3_N; j++) { \
+        int idx = (block_dst[j / 4] >> ((j % 4) * 2)) & 3; \
+        a[j] = tq3_codebook[idx]; \
+    } \
+    /* Unrotate: FWHT then apply signs */ \
+    tq3_fwht(a, TQ3_N); \
     for (int j = 0; j < TQ3_N; j++) \
-        b[j] *= signs[j]; \
+        a[j] *= signs[j]; \
+    /* a[] now holds deq_unrot */ \
     \
-    /* Step 6: Compute residual = x_unit - deq_unrot */ \
-    /* Reload source since a was overwritten by FWHT */ \
+    /* Step 6: Compute residual = x_unit - deq_unrot, store in a[] */ \
     float res_sum_sq = 0.0f; \
     for (int j = 0; j < TQ3_N; j++) { \
-        a[j] = block_src[j] * inv_norm - b[j]; \
+        a[j] = block_src[j] * inv_norm - a[j]; \
         res_sum_sq += a[j] * a[j]; \
     } \
     float res_norm = sqrt(res_sum_sq); \
