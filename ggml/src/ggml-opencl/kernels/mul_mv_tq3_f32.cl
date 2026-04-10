@@ -15,40 +15,42 @@ inline void tq3_fwht(private float * data, int N) {
 }
 
 kernel void kernel_mul_mv_tq3_128_f32(
-        global void  * src0,   ulong offset0,
-        global float * src1,   ulong offset1,
-        global float * dst,    ulong offsetd,
-        int ne00, int ne01, int ne02, int ne10, int ne12,
+        global char * src0,   ulong offset0,
+        global char * src1,   ulong offset1,
+        global char * dst,    ulong offsetd,
+        int ne00, int ne01,
+        ulong nb01, ulong nb02, ulong nb03,
+        int ne12,
+        ulong nb11, ulong nb12, ulong nb13,
         int ne0, int ne1, int r2, int r3,
-        ulong nb01, ulong nb02,
         global const float * signs,
         global const float * s_transpose
 ) {
     #define TQ3_N 128
     #define BLOCK_BYTES 52
 
-    src0 = (global void  *)((global char *)src0 + offset0);
-    src1 = (global float *)((global char *)src1 + offset1);
-    dst  = (global float *)((global char *)dst  + offsetd);
+    src0 = (global char *)src0 + offset0;
+    src1 = (global char *)src1 + offset1;
+    dst  = (global char *)dst  + offsetd;
 
     int ir = get_global_id(0);
     if (ir >= ne01) return;
-    int im = get_global_id(1);
+    int r1 = get_global_id(1);
+    int im = get_global_id(2);
 
-    int i12 = im % ne12;
-    int i13 = im / ne12;
-    int i02 = i12 / r2;
-    int i03 = i13 / r3;
+    uint i12 = im % ne12;
+    uint i13 = im / ne12;
 
     int num_blocks = ne00 / TQ3_N;
 
-    // Use actual tensor strides for row addressing
+    // src0 addressing — matches q8_0 exactly
     global uchar * key_row = (global uchar *)src0
-        + (ulong)i03 * ne02 * nb02
-        + (ulong)i02 * nb02
-        + (ulong)ir * nb01;
+        + (ulong)ir * nb01
+        + (ulong)(i12/r2) * nb02
+        + (ulong)(i13/r3) * nb03;
 
-    global float * query = src1 + (ulong)im * ne10;
+    // src1 addressing — matches q8_0 exactly
+    global float * query = (global float *)(src1 + r1*nb11 + i12*nb12 + i13*nb13);
     float total = 0.0f;
 
     for (int block = 0; block < num_blocks; block++) {
@@ -90,16 +92,20 @@ kernel void kernel_mul_mv_tq3_128_f32(
         total += norm * mse_sum + qjl_scale * norm * resnorm * qjl_sum;
     }
 
-    dst[im * ne0 + ir] = total;
+    // Output: same pattern as q8_0
+    ((global float *)dst)[im*ne0*ne1 + r1*ne0 + ir] = total;
     #undef TQ3_N
     #undef BLOCK_BYTES
 }
 
 kernel void kernel_mul_mv_tq3_256_f32(
-        global void  * src0,   ulong offset0,
-        global float * src1,   ulong offset1,
-        global float * dst,    ulong offsetd,
-        int ne00, int ne01, int ne02, int ne10, int ne12,
+        global char * src0,   ulong offset0,
+        global char * src1,   ulong offset1,
+        global char * dst,    ulong offsetd,
+        int ne00, int ne01,
+        ulong nb01, ulong nb02, ulong nb03,
+        int ne12,
+        ulong nb11, ulong nb12, ulong nb13,
         int ne0, int ne1, int r2, int r3,
         global const float * signs,
         global const float * s_transpose
@@ -107,27 +113,26 @@ kernel void kernel_mul_mv_tq3_256_f32(
     #define TQ3_N 256
     #define BLOCK_BYTES 100
 
-    src0 = (global void  *)((global char *)src0 + offset0);
-    src1 = (global float *)((global char *)src1 + offset1);
-    dst  = (global float *)((global char *)dst  + offsetd);
+    src0 = (global char *)src0 + offset0;
+    src1 = (global char *)src1 + offset1;
+    dst  = (global char *)dst  + offsetd;
 
     int ir = get_global_id(0);
     if (ir >= ne01) return;
-    int im = get_global_id(1);
+    int r1 = get_global_id(1);
+    int im = get_global_id(2);
 
-    int i12 = im % ne12;
-    int i13 = im / ne12;
-    int i02 = i12 / r2;
-    int i03 = i13 / r3;
+    uint i12 = im % ne12;
+    uint i13 = im / ne12;
 
     int num_blocks = ne00 / TQ3_N;
 
     global uchar * key_row = (global uchar *)src0
-        + (ulong)i03 * ne02 * ne01 * (ulong)(num_blocks * BLOCK_BYTES)
-        + (ulong)i02 * ne01 * (ulong)(num_blocks * BLOCK_BYTES)
-        + (ulong)ir * (ulong)(num_blocks * BLOCK_BYTES);
+        + (ulong)ir * nb01
+        + (ulong)(i12/r2) * nb02
+        + (ulong)(i13/r3) * nb03;
 
-    global float * query = src1 + (ulong)im * ne10;
+    global float * query = (global float *)(src1 + r1*nb11 + i12*nb12 + i13*nb13);
     float total = 0.0f;
 
     for (int block = 0; block < num_blocks; block++) {
@@ -169,7 +174,8 @@ kernel void kernel_mul_mv_tq3_256_f32(
         total += norm * mse_sum + qjl_scale * norm * resnorm * qjl_sum;
     }
 
-    dst[im * ne0 + ir] = total;
+    // Output: same pattern as q8_0
+    ((global float *)dst)[im*ne0*ne1 + r1*ne0 + ir] = total;
     #undef TQ3_N
     #undef BLOCK_BYTES
 }
