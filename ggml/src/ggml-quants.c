@@ -2347,10 +2347,9 @@ int  tq3_get_layer(void)      { return tq3_current_layer; }
 static struct {
     uint8_t outlier_ch[TQ_N_OUTLIER];
     bool calibrated;
-    float Pi_out[TQ_N_OUTLIER][TQ_N_OUTLIER];
-    float Pi_reg[TQ_N_REGULAR][TQ_N_REGULAR];
-    float S_out[TQ_N_OUTLIER][TQ_N_OUTLIER];
-    float S_reg[TQ_N_REGULAR][TQ_N_REGULAR];
+    float Pi_out[TQ_N_OUTLIER][TQ_N_OUTLIER];   // 32×32 rotation
+    float Pi_reg[TQ_N_REGULAR][TQ_N_REGULAR];   // 96×96 rotation
+    float S[128][128];                            // UNIFIED QJL projection
     bool matrices_initialized;
 } tq3_layers[TQ_MAX_LAYERS];
 
@@ -2441,8 +2440,7 @@ static void tq3_ensure_layer_matrices(int layer) {
     uint64_t s_seed   = 1042 + (uint64_t)layer * 7;
     tq3_generate_rotation(&tq3_layers[layer].Pi_out[0][0], TQ_N_OUTLIER, rot_seed);
     tq3_generate_rotation(&tq3_layers[layer].Pi_reg[0][0], TQ_N_REGULAR, rot_seed + 1);
-    tq3_generate_s_matrix(&tq3_layers[layer].S_out[0][0],  TQ_N_OUTLIER, s_seed);
-    tq3_generate_s_matrix(&tq3_layers[layer].S_reg[0][0],  TQ_N_REGULAR, s_seed + 1);
+    tq3_generate_s_matrix(&tq3_layers[layer].S[0][0], 128, s_seed);  // ONE 128×128 matrix
     tq3_layers[layer].matrices_initialized = true;
 }
 

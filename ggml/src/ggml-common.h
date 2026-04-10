@@ -280,37 +280,34 @@ static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 
 #define TQ_MAX_LAYERS  128
 
 // TQ3: TurboQuant b=3, 2.5-bit effective (32 outlier @ 4bits + 96 regular @ 2bits)
+// MSE is split by channel group, QJL is UNIFIED on the full 128-dim residual
 typedef struct {
-    uint8_t out_idx[12];          // 32 x 3-bit MSE indices, tight packed
-    uint8_t out_qjl[TQ_N_OUTLIER/8]; // 32 x 1-bit QJL signs (4 bytes)
-    uint8_t reg_idx[TQ_N_REGULAR/8]; // 96 x 1-bit MSE indices (12 bytes)
-    uint8_t reg_qjl[TQ_N_REGULAR/8]; // 96 x 1-bit QJL signs (12 bytes)
-    ggml_half out_norm;
-    ggml_half out_resnorm;
-    ggml_half reg_norm;
-    ggml_half reg_resnorm;
+    uint8_t out_idx[12];              // 32 x 3-bit MSE indices, tight packed
+    uint8_t reg_idx[TQ_N_REGULAR/8];  // 96 x 1-bit MSE indices (12 bytes)
+    uint8_t qjl[128/8];              // 128 x 1-bit UNIFIED QJL signs (16 bytes)
+    ggml_half out_norm;               // outlier sub-vector L2 norm
+    ggml_half reg_norm;               // regular sub-vector L2 norm
+    ggml_half resnorm;                // UNIFIED residual L2 norm
 } block_tq3_128;
-static_assert(sizeof(block_tq3_128) == 48, "wrong tq3_128 block size");
+static_assert(sizeof(block_tq3_128) == 46, "wrong tq3_128 block size");
 
 // TQ4: TurboQuant b=4, 3.5-bit effective (32 outlier @ 5bits + 96 regular @ 3bits)
 typedef struct {
-    uint8_t out_idx[TQ_N_OUTLIER/2]; // 32 x 4-bit MSE indices (16 bytes)
-    uint8_t out_qjl[TQ_N_OUTLIER/8]; // 32 x 1-bit QJL signs (4 bytes)
-    uint8_t reg_idx[TQ_N_REGULAR/4]; // 96 x 2-bit MSE indices (24 bytes)
-    uint8_t reg_qjl[TQ_N_REGULAR/8]; // 96 x 1-bit QJL signs (12 bytes)
+    uint8_t out_idx[TQ_N_OUTLIER/2];  // 32 x 4-bit MSE indices (16 bytes)
+    uint8_t reg_idx[TQ_N_REGULAR/4];  // 96 x 2-bit MSE indices (24 bytes)
+    uint8_t qjl[128/8];              // 128 x 1-bit UNIFIED QJL signs (16 bytes)
     ggml_half out_norm;
-    ggml_half out_resnorm;
     ggml_half reg_norm;
-    ggml_half reg_resnorm;
+    ggml_half resnorm;
 } block_tq4_128;
-static_assert(sizeof(block_tq4_128) == 64, "wrong tq4_128 block size");
+static_assert(sizeof(block_tq4_128) == 62, "wrong tq4_128 block size");
 
 // Query block (shared by TQ3 and TQ4)
+// MSE rotation is per-group, QJL projection is UNIFIED (128-dim)
 typedef struct {
-    float q_rot_out[TQ_N_OUTLIER];   // 32 floats
-    float q_rot_reg[TQ_N_REGULAR];   // 96 floats
-    float q_proj_out[TQ_QJL_OUT];    // 32 floats
-    float q_proj_reg[TQ_QJL_REG];    // 96 floats
+    float q_rot_out[TQ_N_OUTLIER];    // 32 floats — Pi_out × query_outlier
+    float q_rot_reg[TQ_N_REGULAR];    // 96 floats — Pi_reg × query_regular
+    float q_proj[128];                // 128 floats — S × query (UNIFIED)
 } block_tq3_q_128;
 static_assert(sizeof(block_tq3_q_128) == 1024, "wrong tq3_q_128 block size");
 
