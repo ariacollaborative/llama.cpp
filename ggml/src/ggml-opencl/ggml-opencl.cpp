@@ -6483,6 +6483,12 @@ static void ggml_cl_set_rows(ggml_backend_t backend, const ggml_tensor * src0, c
     fastdiv_vals ne11_ = init_fastdiv_values(ne11);
     fastdiv_vals ne12_ = init_fastdiv_values(ne12);
 
+    if (dst->type == GGML_TYPE_TQ3_128 || dst->type == GGML_TYPE_TQ3_256) {
+        static int sr_dbg = 0;
+        if (sr_dbg++ < 3) fprintf(stderr, "TQ3_SR: ne01=%d nb01=%lu nb1=%lu nb2=%lu nblk0=%d off0=%lu offd=%lu\n",
+                ne01, (unsigned long)nb01, (unsigned long)nb1, (unsigned long)nb2,
+                nblk0, (unsigned long)offset0, (unsigned long)offsetd);
+    }
     CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
     CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
     CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra1->data_device));
@@ -11073,13 +11079,16 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &ne1));
                 CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &r2));
                 CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &r3));
+                { cl_ulong nb01 = src0->nb[1]; cl_ulong nb02 = src0->nb[2];
+                CL_CHECK(clSetKernelArg(kernel, 15, sizeof(cl_ulong), &nb01));
+                CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_ulong), &nb02));
                 if (src0t == GGML_TYPE_TQ3_128) {
-                    CL_CHECK(clSetKernelArg(kernel, 15, sizeof(cl_mem), &backend_ctx->tq3_signs_128));
-                    CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_mem), &backend_ctx->tq3_s_transpose_128));
+                    CL_CHECK(clSetKernelArg(kernel, 17, sizeof(cl_mem), &backend_ctx->tq3_signs_128));
+                    CL_CHECK(clSetKernelArg(kernel, 18, sizeof(cl_mem), &backend_ctx->tq3_s_transpose_128));
                 } else {
-                    CL_CHECK(clSetKernelArg(kernel, 15, sizeof(cl_mem), &backend_ctx->tq3_signs_256));
-                    CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_mem), &backend_ctx->tq3_s_transpose_256));
-                }
+                    CL_CHECK(clSetKernelArg(kernel, 17, sizeof(cl_mem), &backend_ctx->tq3_signs_256));
+                    CL_CHECK(clSetKernelArg(kernel, 18, sizeof(cl_mem), &backend_ctx->tq3_s_transpose_256));
+                } }
 
                 size_t global_work_size[] = {(size_t)ne01, (size_t)ne12*ne13, 1};
                 size_t local_work_size[] = {1, 1, 1};
@@ -11703,6 +11712,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         }
         case GGML_TYPE_TQ3_128:
         case GGML_TYPE_TQ3_256: {
+            { static int mv_dbg=0; if(mv_dbg++<2) fprintf(stderr, "TQ3_MV: nb01=%lu nb02=%lu ne00=%d ne01=%d ne02=%d r2=%d\n",
+                    (unsigned long)src0->nb[1], (unsigned long)src0->nb[2], ne00, ne01, ne02, r2); }
             kernel = (src0t == GGML_TYPE_TQ3_128)
                 ? backend_ctx->kernel_mul_mv_tq3_128_f32
                 : backend_ctx->kernel_mul_mv_tq3_256_f32;
@@ -11721,12 +11732,16 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &ne1));
             CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &r2));
             CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &r3));
+            cl_ulong nb01 = src0->nb[1];
+            cl_ulong nb02 = src0->nb[2];
+            CL_CHECK(clSetKernelArg(kernel, 15, sizeof(cl_ulong), &nb01));
+            CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_ulong), &nb02));
             if (src0t == GGML_TYPE_TQ3_128) {
-                CL_CHECK(clSetKernelArg(kernel, 15, sizeof(cl_mem), &backend_ctx->tq3_signs_128));
-                CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_mem), &backend_ctx->tq3_s_transpose_128));
+                CL_CHECK(clSetKernelArg(kernel, 17, sizeof(cl_mem), &backend_ctx->tq3_signs_128));
+                CL_CHECK(clSetKernelArg(kernel, 18, sizeof(cl_mem), &backend_ctx->tq3_s_transpose_128));
             } else {
-                CL_CHECK(clSetKernelArg(kernel, 15, sizeof(cl_mem), &backend_ctx->tq3_signs_256));
-                CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_mem), &backend_ctx->tq3_s_transpose_256));
+                CL_CHECK(clSetKernelArg(kernel, 17, sizeof(cl_mem), &backend_ctx->tq3_signs_256));
+                CL_CHECK(clSetKernelArg(kernel, 18, sizeof(cl_mem), &backend_ctx->tq3_s_transpose_256));
             }
             size_t global_work_size[] = {(size_t)ne01, (size_t)ne12*ne13, 1};
             size_t local_work_size[] = {1, 1, 1};

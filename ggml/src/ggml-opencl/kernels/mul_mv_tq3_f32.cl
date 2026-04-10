@@ -20,6 +20,7 @@ kernel void kernel_mul_mv_tq3_128_f32(
         global float * dst,    ulong offsetd,
         int ne00, int ne01, int ne02, int ne10, int ne12,
         int ne0, int ne1, int r2, int r3,
+        ulong nb01, ulong nb02,
         global const float * signs,
         global const float * s_transpose
 ) {
@@ -41,10 +42,11 @@ kernel void kernel_mul_mv_tq3_128_f32(
 
     int num_blocks = ne00 / TQ3_N;
 
+    // Use actual tensor strides for row addressing
     global uchar * key_row = (global uchar *)src0
-        + (ulong)i03 * ne02 * ne01 * (ulong)(num_blocks * BLOCK_BYTES)
-        + (ulong)i02 * ne01 * (ulong)(num_blocks * BLOCK_BYTES)
-        + (ulong)ir * (ulong)(num_blocks * BLOCK_BYTES);
+        + (ulong)i03 * ne02 * nb02
+        + (ulong)i02 * nb02
+        + (ulong)ir * nb01;
 
     global float * query = src1 + (ulong)im * ne10;
     float total = 0.0f;
