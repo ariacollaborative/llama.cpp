@@ -2918,8 +2918,11 @@ struct ggml_cplan ggml_graph_plan(
 
                         // Decode path: n_kv_chunks = n_tasks (one chunk per thread)
                         // Per-thread: VKQ accmulator (DV), partial M, partial S + intra-thread scratch for V, Q and VKQ
+                        // Q_q buffer must fit the vec_dot_type block (e.g. TQ3_Q_128 = 1024 bytes vs DK*4 = 512)
+                        const enum ggml_type k_vdt = ggml_get_type_traits_cpu(node->src[1]->type)->vec_dot_type;
+                        const int64_t Q_q_sz = MAX(DK, (int64_t)(ggml_row_size(k_vdt, DK) / sizeof(float)));
                         size_t n_chunks = n_tasks;
-                        size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
+                        size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(Q_q_sz + 2*DV));
 
                         cur += MAX(prefill, decode);
                     } break;

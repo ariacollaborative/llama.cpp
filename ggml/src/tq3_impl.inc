@@ -90,7 +90,9 @@ void TQ3_FNAME(dequantize_row_tq3)(const TQ3_BLOCK * GGML_RESTRICT x,
     TQ3_INIT();
     assert(k % TQ3_N == 0);
     const int nb = (int)(k / TQ3_N);
-    const float qjl_scale = sqrtf(3.14159265f / 2.0f) / (float)TQ3_N;
+    // For orthonormal S (unit-norm rows), scale = sqrt(pi/2) / sqrt(N)
+    // (raw Gaussian rows have norm sqrt(N), so projections are sqrt(N) larger)
+    const float qjl_scale = sqrtf(3.14159265f / 2.0f) / sqrtf((float)TQ3_N);
 
     for (int i = 0; i < nb; i++) {
         float * yi = y + (int64_t)i * TQ3_N;
@@ -106,8 +108,8 @@ void TQ3_FNAME(dequantize_row_tq3)(const TQ3_BLOCK * GGML_RESTRICT x,
         tq3_unrotate(yi, y_rot, TQ3_SIGNS, TQ3_N);
         for (int j = 0; j < TQ3_N; j++) yi[j] *= norm;
 
-        // Add QJL correction
-        if (rnorm > 1e-10f) {
+        // QJL correction — disabled (noise > signal at d=128, see handoff)
+        if (0 && rnorm > 1e-10f) {
             float qjl_signs[TQ3_N];
             for (int j = 0; j < TQ3_N; j++)
                 qjl_signs[j] = (x[i].qjl[j/8] & (1u << (j%8))) ? 1.0f : -1.0f;
@@ -185,74 +187,8 @@ void TQ3_FNAME(ggml_vec_dot_tq3_q)(int n, float * GGML_RESTRICT s, size_t bs,
     const TQ3_BLOCK  * GGML_RESTRICT x = (const TQ3_BLOCK  *)vx;
     const TQ3_QBLOCK * GGML_RESTRICT y = (const TQ3_QBLOCK *)vy;
     const int nb = n / TQ3_N;
-    const float qjl_scale = sqrtf(3.14159265f / 2.0f) / (float)TQ3_N;
     float sumf = 0.0f;
 
-#if defined(__ARM_NEON)
-    for (int i = 0; i < nb; i++) {
-        const float norm = GGML_FP16_TO_FP32(x[i].norm);
-        if (norm < 1e-10f) continue;
-
-        // MSE dot: 4 accumulators, gather-free conditional add
-        float32x4_t acc0 = vdupq_n_f32(0.0f);
-        float32x4_t acc1 = vdupq_n_f32(0.0f);
-        float32x4_t acc2 = vdupq_n_f32(0.0f);
-        float32x4_t acc3 = vdupq_n_f32(0.0f);
-
-        for (int j = 0; j < TQ3_N; j += 8) {
-            float32x4_t qr0 = vld1q_f32(&y[i].q_rot[j+0]);
-            float32x4_t qr1 = vld1q_f32(&y[i].q_rot[j+4]);
-            // Load 2 bytes of packed 2-bit indices (8 indices)
-            uint16_t packed;
-            memcpy(&packed, &x[i].idx[j/4], 2);
-            int32_t idx32[8];
-            for (int k = 0; k < 8; k++) idx32[k] = (packed >> (k*2)) & 3;
-            int32x4_t vi0 = vld1q_s32(idx32+0);
-            int32x4_t vi1 = vld1q_s32(idx32+4);
-
-            // Accumulate: add qr where index == codebook entry
-            acc0 = vaddq_f32(acc0, vaddq_f32(
-                vreinterpretq_f32_u32(vandq_u32(vceqq_s32(vi0, vdupq_n_s32(0)), vreinterpretq_u32_f32(qr0))),
-                vreinterpretq_f32_u32(vandq_u32(vceqq_s32(vi1, vdupq_n_s32(0)), vreinterpretq_u32_f32(qr1)))));
-            acc1 = vaddq_f32(acc1, vaddq_f32(
-                vreinterpretq_f32_u32(vandq_u32(vceqq_s32(vi0, vdupq_n_s32(1)), vreinterpretq_u32_f32(qr0))),
-                vreinterpretq_f32_u32(vandq_u32(vceqq_s32(vi1, vdupq_n_s32(1)), vreinterpretq_u32_f32(qr1)))));
-            acc2 = vaddq_f32(acc2, vaddq_f32(
-                vreinterpretq_f32_u32(vandq_u32(vceqq_s32(vi0, vdupq_n_s32(2)), vreinterpretq_u32_f32(qr0))),
-                vreinterpretq_f32_u32(vandq_u32(vceqq_s32(vi1, vdupq_n_s32(2)), vreinterpretq_u32_f32(qr1)))));
-            acc3 = vaddq_f32(acc3, vaddq_f32(
-                vreinterpretq_f32_u32(vandq_u32(vceqq_s32(vi0, vdupq_n_s32(3)), vreinterpretq_u32_f32(qr0))),
-                vreinterpretq_f32_u32(vandq_u32(vceqq_s32(vi1, vdupq_n_s32(3)), vreinterpretq_u32_f32(qr1)))));
-        }
-        float mse_dot = vaddvq_f32(acc0) * tq3_codebook[0]
-                      + vaddvq_f32(acc1) * tq3_codebook[1]
-                      + vaddvq_f32(acc2) * tq3_codebook[2]
-                      + vaddvq_f32(acc3) * tq3_codebook[3];
-
-        const float rnorm = GGML_FP16_TO_FP32(x[i].res_norm);
-        float qjl_dot = 0.0f;
-        if (rnorm > 1e-10f) {
-            const uint32_t SIGN_BIT = 0x80000000u;
-            float32x4_t qacc = vdupq_n_f32(0.0f);
-            for (int j = 0; j < TQ3_N; j += 8) {
-                float32x4_t qp0 = vld1q_f32(&y[i].q_proj[j+0]);
-                float32x4_t qp1 = vld1q_f32(&y[i].q_proj[j+4]);
-                uint8_t bits = x[i].qjl[j/8];
-                uint32_t flip[8];
-                for (int k = 0; k < 8; k++)
-                    flip[k] = (bits & (1u << k)) ? 0u : SIGN_BIT;
-                float32x4_t s0 = vreinterpretq_f32_u32(
-                    veorq_u32(vreinterpretq_u32_f32(qp0), vld1q_u32(flip+0)));
-                float32x4_t s1 = vreinterpretq_f32_u32(
-                    veorq_u32(vreinterpretq_u32_f32(qp1), vld1q_u32(flip+4)));
-                qacc = vaddq_f32(qacc, vaddq_f32(s0, s1));
-            }
-            qjl_dot = vaddvq_f32(qacc);
-        }
-        sumf += norm * mse_dot + qjl_scale * norm * rnorm * qjl_dot;
-    }
-#else
-    // Scalar fallback
     for (int i = 0; i < nb; i++) {
         const float norm = GGML_FP16_TO_FP32(x[i].norm);
         if (norm < 1e-10f) continue;
@@ -262,18 +198,9 @@ void TQ3_FNAME(ggml_vec_dot_tq3_q)(int n, float * GGML_RESTRICT s, size_t bs,
             int qi = (x[i].idx[j/4] >> ((j%4)*2)) & 0x3;
             mse_dot += y[i].q_rot[j] * tq3_codebook[qi];
         }
-
-        const float rnorm = GGML_FP16_TO_FP32(x[i].res_norm);
-        float qjl_dot = 0.0f;
-        if (rnorm > 1e-10f) {
-            for (int j = 0; j < TQ3_N; j++) {
-                float sign = (x[i].qjl[j/8] & (1u << (j%8))) ? 1.0f : -1.0f;
-                qjl_dot += y[i].q_proj[j] * sign;
-            }
-        }
-        sumf += norm * mse_dot + qjl_scale * norm * rnorm * qjl_dot;
+        sumf += norm * mse_dot;
     }
-#endif
+
     *s = sumf;
 }
 

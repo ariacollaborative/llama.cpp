@@ -2378,6 +2378,23 @@ static void tq3_ensure_init_128(void) {
     for (int i = 0; i < QK_TQ3_128; i++)
         for (int j = 0; j < QK_TQ3_128; j++)
             tq3_S_128[i][j] = (float)tq3_gaussian();
+    // Orthogonalize rows via Modified Gram-Schmidt
+    // Step 1: orthogonalize to unit vectors
+    for (int i = 0; i < QK_TQ3_128; i++) {
+        for (int k = 0; k < i; k++) {
+            float dot = 0.0f;
+            for (int j = 0; j < QK_TQ3_128; j++) dot += tq3_S_128[i][j] * tq3_S_128[k][j];
+            for (int j = 0; j < QK_TQ3_128; j++) tq3_S_128[i][j] -= dot * tq3_S_128[k][j];
+        }
+        float norm = 0.0f;
+        for (int j = 0; j < QK_TQ3_128; j++) norm += tq3_S_128[i][j] * tq3_S_128[i][j];
+        norm = sqrtf(norm);
+        if (norm > 1e-10f) {
+            float inv = 1.0f / norm;
+            for (int j = 0; j < QK_TQ3_128; j++) tq3_S_128[i][j] *= inv;
+        }
+    }
+    // Rows are orthonormal (unit length). The qjl_scale factor accounts for this.
     tq3_inited_128 = 1;
 }
 

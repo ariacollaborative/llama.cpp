@@ -8268,7 +8268,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         float S = 0.0f;      // sum
         float M = -INFINITY; // maximum KQ value
 
-        float       * VKQ32 = (float       *) params->wdata + ith*(1*DK + 2*DV + CACHE_LINE_SIZE_F32); // FP32 VKQ accumulator
+        // Q_q buffer size: must fit the vec_dot_type block for DK elements
+        const int64_t Q_q_floats = MAX(DK, (int64_t)(ggml_row_size(k_vec_dot_type, DK) / sizeof(float)));
+        float       * VKQ32 = (float       *) params->wdata + ith*(Q_q_floats + 2*DV + CACHE_LINE_SIZE_F32); // FP32 VKQ accumulator
         float       * V32   =                 (VKQ32 + 1*DV); // (temporary) FP32 V buffer
         ggml_fp16_t * VKQ16 = (ggml_fp16_t *) (VKQ32 + 1*DV); // (temporary) FP16 VKQ accumulator
         ggml_fp16_t * Q_q   = (ggml_fp16_t *) (VKQ32 + 2*DV); // (temporary) buffer for Q converted to quantized/FP16
@@ -8718,10 +8720,12 @@ static void ggml_flash_attn_ext_reduce_partials(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    const int64_t wdata_per_thread = DK + 2*DV + CACHE_LINE_SIZE_F32;
+    const ggml_type k_vec_dot_type = ggml_get_type_traits_cpu(k->type)->vec_dot_type;
+    const int64_t Q_q_floats = MAX(DK, (int64_t)(ggml_row_size(k_vec_dot_type, DK) / sizeof(float)));
+    const int64_t wdata_per_thread = Q_q_floats + 2*DV + CACHE_LINE_SIZE_F32;
     float *       thread_wdata     = (float *) params->wdata + ith * wdata_per_thread;
 
-    const int64_t partials_offset  = nth * (DK + 2*DV + CACHE_LINE_SIZE_F32);
+    const int64_t partials_offset  = nth * (Q_q_floats + 2*DV + CACHE_LINE_SIZE_F32);
     const int64_t partial_size     = 2 + DV;
     const float * partials_base    = (const float *) params->wdata + partials_offset;
 
