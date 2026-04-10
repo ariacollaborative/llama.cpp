@@ -291,10 +291,15 @@ typedef struct {
 } block_tq3_128;
 static_assert(sizeof(block_tq3_128) == 46, "wrong tq3_128 block size");
 
-// TQ4: TurboQuant b=4, 3.5-bit effective (32 outlier @ 5bits + 96 regular @ 3bits)
+// TQ4: TurboQuant b=4, 3.5-bit effective (64 outlier @ b=4 + 64 regular @ b=3)
+// 64 outlier: 3-bit MSE (8 centroids) + 1-bit QJL = 4 bits/ch
+// 64 regular: 2-bit MSE (4 centroids) + 1-bit QJL = 3 bits/ch
+// (64*4 + 64*3)/128 = 3.5 effective
+#define TQ4_N_OUTLIER   64
+#define TQ4_N_REGULAR   64
 typedef struct {
-    uint8_t out_idx[TQ_N_OUTLIER/2];  // 32 x 4-bit MSE indices (16 bytes)
-    uint8_t reg_idx[TQ_N_REGULAR/4];  // 96 x 2-bit MSE indices (24 bytes)
+    uint8_t out_idx[64*3/8];          // 64 x 3-bit MSE indices tight packed (24 bytes)
+    uint8_t reg_idx[64/4];            // 64 x 2-bit MSE indices (16 bytes)
     uint8_t qjl[128/8];              // 128 x 1-bit UNIFIED QJL signs (16 bytes)
     ggml_half out_norm;
     ggml_half reg_norm;
@@ -303,13 +308,17 @@ typedef struct {
 static_assert(sizeof(block_tq4_128) == 62, "wrong tq4_128 block size");
 
 // Query block (shared by TQ3 and TQ4)
+// Sized to the MAX group sizes across both types:
+//   q_rot_out: max(TQ3=32, TQ4=64) = 64 floats
+//   q_rot_reg: max(TQ3=96, TQ4=64) = 96 floats
+// TQ3 vecdot reads first 32 entries; TQ4 vecdot reads all 64.
 // MSE rotation is per-group, QJL projection is UNIFIED (128-dim)
 typedef struct {
-    float q_rot_out[TQ_N_OUTLIER];    // 32 floats — Pi_out × query_outlier
-    float q_rot_reg[TQ_N_REGULAR];    // 96 floats — Pi_reg × query_regular
+    float q_rot_out[64];              // 64 floats — Pi_out × query_outlier (max size)
+    float q_rot_reg[96];              // 96 floats — Pi_reg × query_regular (max size)
     float q_proj[128];                // 128 floats — S × query (UNIFIED)
 } block_tq3_q_128;
-static_assert(sizeof(block_tq3_q_128) == 1024, "wrong tq3_q_128 block size");
+static_assert(sizeof(block_tq3_q_128) == 1152, "wrong tq3_q_128 block size");
 
 //
 // Super-block quantization structures

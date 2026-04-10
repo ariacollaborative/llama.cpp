@@ -1,12 +1,12 @@
 // tq3_impl.inc — TurboQuant mixed-precision KV cache quantization
 //
 // Included TWICE from ggml-quants.c:
-//   First  include: TQ_OUT_BITS=3, TQ_REG_BITS=1  (tq3_128, 2.5-bit effective)
-//   Second include: TQ_OUT_BITS=4, TQ_REG_BITS=2  (tq4_128, 3.5-bit effective)
+//   First  include: TQ_N_OUT=32, TQ_N_REG=96, TQ_OUT_BITS=3, TQ_REG_BITS=1  (tq3_128, 2.5-bit effective)
+//   Second include: TQ_N_OUT=64, TQ_N_REG=64, TQ_OUT_BITS=3, TQ_REG_BITS=2  (tq4_128, 3.5-bit effective)
 //
 // Each 128-element block is split into:
-//   Outlier group  — 32 channels (TQ_N_OUTLIER), TQ_OUT_BITS MSE + 1-bit QJL
-//   Regular group  — 96 channels (TQ_N_REGULAR), TQ_REG_BITS MSE + 1-bit QJL
+//   Outlier group  — TQ_N_OUT channels, TQ_OUT_BITS MSE + 1-bit QJL
+//   Regular group  — TQ_N_REG channels, TQ_REG_BITS MSE + 1-bit QJL
 //
 // Algorithm per group:
 //   Quantize: normalize → rotate (Pi) → scalar VQ → inverse-rotate → residual
@@ -42,12 +42,14 @@ static void tq_matvec_t(const float * M, const float * v, float * out, int d1, i
     }
 }
 
-// Tight 3-bit packing: 32 indices (0-7) → 12 bytes (8 per 3-byte group).
+// Tight 3-bit packing: n indices (0-7, n must be multiple of 8) → n*3/8 bytes.
+//   Per 8-element group (3 bytes):
 //   byte0 = i0[2:0] | i1[2:0]<<3 | i2[1:0]<<6
 //   byte1 = i2[2]   | i3[2:0]<<1 | i4[2:0]<<4 | i5[0]<<7
 //   byte2 = i5[2:1] | i6[2:0]<<2 | i7[2:0]<<5
-static void tq_pack_3bit(const uint8_t * idx, uint8_t * packed) {
-    for (int g = 0; g < 4; g++) {
+static void tq_pack_3bit(const uint8_t * idx, uint8_t * packed, int n) {
+    int ngroups = n / 8;
+    for (int g = 0; g < ngroups; g++) {
         const uint8_t * in  = idx    + g*8;
         uint8_t       * out = packed + g*3;
         out[0] = (in[0] & 7) | ((in[1] & 7) << 3) | ((in[2] & 3) << 6);
@@ -56,8 +58,9 @@ static void tq_pack_3bit(const uint8_t * idx, uint8_t * packed) {
     }
 }
 
-static void tq_unpack_3bit(const uint8_t * packed, uint8_t * idx) {
-    for (int g = 0; g < 4; g++) {
+static void tq_unpack_3bit(const uint8_t * packed, uint8_t * idx, int n) {
+    int ngroups = n / 8;
+    for (int g = 0; g < ngroups; g++) {
         const uint8_t * in  = packed + g*3;
         uint8_t       * out = idx    + g*8;
         out[0] =  in[0]        & 7;
@@ -81,10 +84,10 @@ static inline int tq_find_idx(float val, const float * bd, int nclusters) {
     return best;
 }
 
-// Build outlier membership mask: is_out[c] = 1 iff channel c is an outlier.
-static void tq_build_outlier_mask(const uint8_t * outlier_ch, uint8_t * is_out) {
+// Build outlier membership mask: is_out[c] = 1 iff channel c is in the top-n_out.
+static void tq_build_outlier_mask(const uint8_t * outlier_ch, uint8_t * is_out, int n_out) {
     memset(is_out, 0, 128);
-    for (int i = 0; i < TQ_N_OUTLIER; i++) is_out[outlier_ch[i]] = 1;
+    for (int i = 0; i < n_out; i++) is_out[outlier_ch[i]] = 1;
 }
 
 // Populate out_pos[] and reg_pos[] from membership mask.
@@ -98,8 +101,11 @@ static void tq_build_channel_split(const uint8_t * is_out,
 }
 
 // Populate channel split and matrix pointers from per-layer state.
-// Falls back to channels 0-31 as outliers and NULL matrices when unavailable.
-static void tq_resolve_layer(int layer,
+// n_out selects which rotation matrix to return:
+//   n_out==32 → Pi_out_small (32×32), Pi_reg_large (96×96)   [TQ3]
+//   n_out==64 → Pi_out_large (64×64), Pi_reg_small (64×64)   [TQ4]
+// Falls back to channels 0..n_out-1 as outliers and NULL matrices when unavailable.
+static void tq_resolve_layer(int layer, int n_out,
                              uint8_t * out_pos, uint8_t * reg_pos,
                              const float ** Pi_out, const float ** Pi_reg,
                              const float ** S) {
@@ -107,21 +113,26 @@ static void tq_resolve_layer(int layer,
     if (layer >= 0 && layer < TQ_MAX_LAYERS) {
         tq3_ensure_layer_matrices(layer);
         if (tq3_layers[layer].calibrated) {
-            tq_build_outlier_mask(tq3_layers[layer].outlier_ch, is_out);
+            tq_build_outlier_mask(tq3_layers[layer].outlier_ch, is_out, n_out);
         } else {
             memset(is_out, 0, 128);
-            for (int c = 0; c < TQ_N_OUTLIER; c++) is_out[c] = 1;
+            for (int c = 0; c < n_out; c++) is_out[c] = 1;
         }
         if (tq3_layers[layer].matrices_initialized) {
-            *Pi_out = &tq3_layers[layer].Pi_out[0][0];
-            *Pi_reg = &tq3_layers[layer].Pi_reg[0][0];
-            *S      = &tq3_layers[layer].S[0][0];
+            if (n_out == 32) {
+                *Pi_out = &tq3_layers[layer].Pi_out_small[0][0];
+                *Pi_reg = &tq3_layers[layer].Pi_reg_large[0][0];
+            } else {
+                *Pi_out = &tq3_layers[layer].Pi_out_large[0][0];
+                *Pi_reg = &tq3_layers[layer].Pi_reg_small[0][0];
+            }
+            *S = &tq3_layers[layer].S[0][0];
         } else {
             *Pi_out = *Pi_reg = *S = NULL;
         }
     } else {
         memset(is_out, 0, 128);
-        for (int c = 0; c < TQ_N_OUTLIER; c++) is_out[c] = 1;
+        for (int c = 0; c < n_out; c++) is_out[c] = 1;
         *Pi_out = *Pi_reg = *S = NULL;
     }
     tq_build_channel_split(is_out, out_pos, reg_pos);
@@ -152,106 +163,100 @@ static void TQ_FN(quant_impl)(const float * GGML_RESTRICT x,
         tq3_calibrate_outliers(layer, x, k);
     }
 
-    uint8_t out_pos[TQ_N_OUTLIER];
-    uint8_t reg_pos[TQ_N_REGULAR];
+    uint8_t out_pos[TQ_N_OUT];
+    uint8_t reg_pos[TQ_N_REG];
     const float * Pi_out, * Pi_reg, * S;
-    tq_resolve_layer(layer, out_pos, reg_pos, &Pi_out, &Pi_reg, &S);
+    tq_resolve_layer(layer, TQ_N_OUT, out_pos, reg_pos, &Pi_out, &Pi_reg, &S);
 
     for (int64_t i = 0; i < nb; i++) {
         const float * xi = x + i * TQ_N;
         TQ_BLOCK    * yi = y + i;
 
         // Split into outlier / regular sub-vectors.
-        float x_out[TQ_N_OUTLIER];
-        float x_reg[TQ_N_REGULAR];
-        for (int j = 0; j < TQ_N_OUTLIER; j++) x_out[j] = xi[out_pos[j]];
-        for (int j = 0; j < TQ_N_REGULAR; j++) x_reg[j] = xi[reg_pos[j]];
+        float x_out[TQ_N_OUT];
+        float x_reg[TQ_N_REG];
+        for (int j = 0; j < TQ_N_OUT; j++) x_out[j] = xi[out_pos[j]];
+        for (int j = 0; j < TQ_N_REG; j++) x_reg[j] = xi[reg_pos[j]];
 
         // ---- Outlier group MSE --------------------------------------------
         float out_norm;
-        uint8_t out_idx[TQ_N_OUTLIER];
-        float x_mse_out[TQ_N_OUTLIER];
+        uint8_t out_idx[TQ_N_OUT];
+        float x_mse_out[TQ_N_OUT];
         {
             // Norm and unit vector.
             float norm = 0.0f;
-            for (int j = 0; j < TQ_N_OUTLIER; j++) norm += x_out[j] * x_out[j];
+            for (int j = 0; j < TQ_N_OUT; j++) norm += x_out[j] * x_out[j];
             norm = sqrtf(norm);
             out_norm = norm;
             float inv_norm = (norm > 1e-12f) ? 1.0f / norm : 0.0f;
 
-            float x_unit[TQ_N_OUTLIER];
-            for (int j = 0; j < TQ_N_OUTLIER; j++) x_unit[j] = x_out[j] * inv_norm;
+            float x_unit[TQ_N_OUT];
+            for (int j = 0; j < TQ_N_OUT; j++) x_unit[j] = x_out[j] * inv_norm;
 
             // y_rot = Pi_out × x_unit
-            float y_rot[TQ_N_OUTLIER];
-            if (Pi_out) tq_matvec(Pi_out, x_unit, y_rot, TQ_N_OUTLIER, TQ_N_OUTLIER);
-            else        for (int j = 0; j < TQ_N_OUTLIER; j++) y_rot[j] = x_unit[j];
+            float y_rot[TQ_N_OUT];
+            if (Pi_out) tq_matvec(Pi_out, x_unit, y_rot, TQ_N_OUT, TQ_N_OUT);
+            else        for (int j = 0; j < TQ_N_OUT; j++) y_rot[j] = x_unit[j];
 
             // Scalar VQ in rotated domain.
-            float y_deq[TQ_N_OUTLIER];
-            for (int j = 0; j < TQ_N_OUTLIER; j++) {
+            float y_deq[TQ_N_OUT];
+            for (int j = 0; j < TQ_N_OUT; j++) {
                 int idx    = tq_find_idx(y_rot[j], TQ_OUT_BD, TQ_OUT_NCLUSTERS);
                 out_idx[j] = (uint8_t)idx;
                 y_deq[j]   = TQ_OUT_CB[idx];
             }
 
             // Dequantize back: x_mse_out = norm * Pi_out^T × y_deq
-            float x_mse_unit[TQ_N_OUTLIER];
-            if (Pi_out) tq_matvec_t(Pi_out, y_deq, x_mse_unit, TQ_N_OUTLIER, TQ_N_OUTLIER);
-            else        for (int j = 0; j < TQ_N_OUTLIER; j++) x_mse_unit[j] = y_deq[j];
-            for (int j = 0; j < TQ_N_OUTLIER; j++) x_mse_out[j] = norm * x_mse_unit[j];
+            float x_mse_unit[TQ_N_OUT];
+            if (Pi_out) tq_matvec_t(Pi_out, y_deq, x_mse_unit, TQ_N_OUT, TQ_N_OUT);
+            else        for (int j = 0; j < TQ_N_OUT; j++) x_mse_unit[j] = y_deq[j];
+            for (int j = 0; j < TQ_N_OUT; j++) x_mse_out[j] = norm * x_mse_unit[j];
 
-            // Pack MSE indices.
-#if TQ_OUT_BITS == 3
-            tq_pack_3bit(out_idx, yi->out_idx);
-#else
-            // 4-bit nibble: 2 indices per byte.
-            for (int j = 0; j < TQ_N_OUTLIER/2; j++)
-                yi->out_idx[j] = (out_idx[2*j] & 0xf) | ((out_idx[2*j+1] & 0xf) << 4);
-#endif
+            // Pack MSE indices (3-bit for both TQ3 and TQ4 outlier group).
+            tq_pack_3bit(out_idx, yi->out_idx, TQ_N_OUT);
             yi->out_norm = GGML_FP32_TO_FP16(norm);
         }
 
         // ---- Regular group MSE --------------------------------------------
         float reg_norm;
-        uint8_t reg_idx[TQ_N_REGULAR];
-        float x_mse_reg[TQ_N_REGULAR];
+        uint8_t reg_idx[TQ_N_REG];
+        float x_mse_reg[TQ_N_REG];
         {
             float norm = 0.0f;
-            for (int j = 0; j < TQ_N_REGULAR; j++) norm += x_reg[j] * x_reg[j];
+            for (int j = 0; j < TQ_N_REG; j++) norm += x_reg[j] * x_reg[j];
             norm = sqrtf(norm);
             reg_norm = norm;
             float inv_norm = (norm > 1e-12f) ? 1.0f / norm : 0.0f;
 
-            float x_unit[TQ_N_REGULAR];
-            for (int j = 0; j < TQ_N_REGULAR; j++) x_unit[j] = x_reg[j] * inv_norm;
+            float x_unit[TQ_N_REG];
+            for (int j = 0; j < TQ_N_REG; j++) x_unit[j] = x_reg[j] * inv_norm;
 
-            float y_rot[TQ_N_REGULAR];
-            if (Pi_reg) tq_matvec(Pi_reg, x_unit, y_rot, TQ_N_REGULAR, TQ_N_REGULAR);
-            else        for (int j = 0; j < TQ_N_REGULAR; j++) y_rot[j] = x_unit[j];
+            float y_rot[TQ_N_REG];
+            if (Pi_reg) tq_matvec(Pi_reg, x_unit, y_rot, TQ_N_REG, TQ_N_REG);
+            else        for (int j = 0; j < TQ_N_REG; j++) y_rot[j] = x_unit[j];
 
-            float y_deq[TQ_N_REGULAR];
-            for (int j = 0; j < TQ_N_REGULAR; j++) {
+            float y_deq[TQ_N_REG];
+            for (int j = 0; j < TQ_N_REG; j++) {
                 int idx    = tq_find_idx(y_rot[j], TQ_REG_BD, TQ_REG_NCLUSTERS);
                 reg_idx[j] = (uint8_t)idx;
                 y_deq[j]   = TQ_REG_CB[idx];
             }
 
             // Dequantize back: x_mse_reg = norm * Pi_reg^T × y_deq
-            float x_mse_unit[TQ_N_REGULAR];
-            if (Pi_reg) tq_matvec_t(Pi_reg, y_deq, x_mse_unit, TQ_N_REGULAR, TQ_N_REGULAR);
-            else        for (int j = 0; j < TQ_N_REGULAR; j++) x_mse_unit[j] = y_deq[j];
-            for (int j = 0; j < TQ_N_REGULAR; j++) x_mse_reg[j] = norm * x_mse_unit[j];
+            float x_mse_unit[TQ_N_REG];
+            if (Pi_reg) tq_matvec_t(Pi_reg, y_deq, x_mse_unit, TQ_N_REG, TQ_N_REG);
+            else        for (int j = 0; j < TQ_N_REG; j++) x_mse_unit[j] = y_deq[j];
+            for (int j = 0; j < TQ_N_REG; j++) x_mse_reg[j] = norm * x_mse_unit[j];
 
             // Pack MSE indices.
 #if TQ_REG_BITS == 1
             // 1-bit: 8 indices per byte.
-            memset(yi->reg_idx, 0, TQ_N_REGULAR/8);
-            for (int j = 0; j < TQ_N_REGULAR; j++)
+            memset(yi->reg_idx, 0, TQ_N_REG/8);
+            for (int j = 0; j < TQ_N_REG; j++)
                 if (reg_idx[j] & 1) yi->reg_idx[j/8] |= (uint8_t)(1u << (j%8));
 #else
             // 2-bit: 4 indices per byte.
-            for (int j = 0; j < TQ_N_REGULAR/4; j++)
+            for (int j = 0; j < TQ_N_REG/4; j++)
                 yi->reg_idx[j] = (reg_idx[4*j] & 3) | ((reg_idx[4*j+1] & 3) << 2)
                                | ((reg_idx[4*j+2] & 3) << 4) | ((reg_idx[4*j+3] & 3) << 6);
 #endif
@@ -262,8 +267,8 @@ static void TQ_FN(quant_impl)(const float * GGML_RESTRICT x,
         {
             // Reassemble x_mse[128] at original channel positions.
             float x_mse[128];
-            for (int j = 0; j < TQ_N_OUTLIER; j++) x_mse[out_pos[j]] = x_mse_out[j];
-            for (int j = 0; j < TQ_N_REGULAR; j++) x_mse[reg_pos[j]] = x_mse_reg[j];
+            for (int j = 0; j < TQ_N_OUT; j++) x_mse[out_pos[j]] = x_mse_out[j];
+            for (int j = 0; j < TQ_N_REG; j++) x_mse[reg_pos[j]] = x_mse_reg[j];
 
             // Unified residual: r[j] = x[j] - x_mse[j]
             float r[128];
@@ -293,7 +298,8 @@ static void TQ_FN(quant_impl)(const float * GGML_RESTRICT x,
 }
 
 // Public quantize_row_ref — exact names from ggml-quants.h.
-#if TQ_OUT_BITS == 3
+// Discriminated by TQ_N_OUT: 32 = TQ3, 64 = TQ4.
+#if TQ_N_OUT == 32
 void quantize_row_tq3_128_ref(const float * GGML_RESTRICT x,
                                block_tq3_128 * GGML_RESTRICT y, int64_t k) {
     quant_impl_tq3_128(x, y, k);
@@ -324,10 +330,10 @@ static void TQ_FN(dequant_impl)(const TQ_BLOCK * GGML_RESTRICT x,
 
     int layer = tq3_get_layer();
 
-    uint8_t out_pos[TQ_N_OUTLIER];
-    uint8_t reg_pos[TQ_N_REGULAR];
+    uint8_t out_pos[TQ_N_OUT];
+    uint8_t reg_pos[TQ_N_REG];
     const float * Pi_out, * Pi_reg, * S;
-    tq_resolve_layer(layer, out_pos, reg_pos, &Pi_out, &Pi_reg, &S);
+    tq_resolve_layer(layer, TQ_N_OUT, out_pos, reg_pos, &Pi_out, &Pi_reg, &S);
 
     const float QJL_SCALE = TQ_SQRT_PI_2 / 128.0f;
 
@@ -340,36 +346,30 @@ static void TQ_FN(dequant_impl)(const TQ_BLOCK * GGML_RESTRICT x,
         float resnorm  = GGML_FP16_TO_FP32(xi->resnorm);
 
         // ---- Outlier group MSE --------------------------------------------
-        float x_mse_out[TQ_N_OUTLIER];
+        float x_mse_out[TQ_N_OUT];
         {
-            uint8_t out_idx[TQ_N_OUTLIER];
-#if TQ_OUT_BITS == 3
-            tq_unpack_3bit(xi->out_idx, out_idx);
-#else
-            for (int j = 0; j < TQ_N_OUTLIER/2; j++) {
-                out_idx[2*j]   = xi->out_idx[j] & 0xf;
-                out_idx[2*j+1] = (xi->out_idx[j] >> 4) & 0xf;
-            }
-#endif
-            float y_deq[TQ_N_OUTLIER];
-            for (int j = 0; j < TQ_N_OUTLIER; j++) y_deq[j] = TQ_OUT_CB[out_idx[j]];
+            uint8_t out_idx[TQ_N_OUT];
+            tq_unpack_3bit(xi->out_idx, out_idx, TQ_N_OUT);
+
+            float y_deq[TQ_N_OUT];
+            for (int j = 0; j < TQ_N_OUT; j++) y_deq[j] = TQ_OUT_CB[out_idx[j]];
 
             // x_mse_out = norm_out * Pi_out^T × y_deq
-            float x_mse_unit[TQ_N_OUTLIER];
-            if (Pi_out) tq_matvec_t(Pi_out, y_deq, x_mse_unit, TQ_N_OUTLIER, TQ_N_OUTLIER);
-            else        for (int j = 0; j < TQ_N_OUTLIER; j++) x_mse_unit[j] = y_deq[j];
-            for (int j = 0; j < TQ_N_OUTLIER; j++) x_mse_out[j] = norm_out * x_mse_unit[j];
+            float x_mse_unit[TQ_N_OUT];
+            if (Pi_out) tq_matvec_t(Pi_out, y_deq, x_mse_unit, TQ_N_OUT, TQ_N_OUT);
+            else        for (int j = 0; j < TQ_N_OUT; j++) x_mse_unit[j] = y_deq[j];
+            for (int j = 0; j < TQ_N_OUT; j++) x_mse_out[j] = norm_out * x_mse_unit[j];
         }
 
         // ---- Regular group MSE --------------------------------------------
-        float x_mse_reg[TQ_N_REGULAR];
+        float x_mse_reg[TQ_N_REG];
         {
-            uint8_t reg_idx[TQ_N_REGULAR];
+            uint8_t reg_idx[TQ_N_REG];
 #if TQ_REG_BITS == 1
-            for (int j = 0; j < TQ_N_REGULAR; j++)
+            for (int j = 0; j < TQ_N_REG; j++)
                 reg_idx[j] = (xi->reg_idx[j/8] >> (j%8)) & 1;
 #else
-            for (int j = 0; j < TQ_N_REGULAR/4; j++) {
+            for (int j = 0; j < TQ_N_REG/4; j++) {
                 uint8_t b = xi->reg_idx[j];
                 reg_idx[4*j]   =  b       & 3;
                 reg_idx[4*j+1] = (b >> 2) & 3;
@@ -377,22 +377,22 @@ static void TQ_FN(dequant_impl)(const TQ_BLOCK * GGML_RESTRICT x,
                 reg_idx[4*j+3] = (b >> 6) & 3;
             }
 #endif
-            float y_deq[TQ_N_REGULAR];
-            for (int j = 0; j < TQ_N_REGULAR; j++) y_deq[j] = TQ_REG_CB[reg_idx[j]];
+            float y_deq[TQ_N_REG];
+            for (int j = 0; j < TQ_N_REG; j++) y_deq[j] = TQ_REG_CB[reg_idx[j]];
 
             // x_mse_reg = norm_reg * Pi_reg^T × y_deq
-            float x_mse_unit[TQ_N_REGULAR];
-            if (Pi_reg) tq_matvec_t(Pi_reg, y_deq, x_mse_unit, TQ_N_REGULAR, TQ_N_REGULAR);
-            else        for (int j = 0; j < TQ_N_REGULAR; j++) x_mse_unit[j] = y_deq[j];
-            for (int j = 0; j < TQ_N_REGULAR; j++) x_mse_reg[j] = norm_reg * x_mse_unit[j];
+            float x_mse_unit[TQ_N_REG];
+            if (Pi_reg) tq_matvec_t(Pi_reg, y_deq, x_mse_unit, TQ_N_REG, TQ_N_REG);
+            else        for (int j = 0; j < TQ_N_REG; j++) x_mse_unit[j] = y_deq[j];
+            for (int j = 0; j < TQ_N_REG; j++) x_mse_reg[j] = norm_reg * x_mse_unit[j];
         }
 
         // ---- Reassemble x_mse[128] and apply UNIFIED QJL correction -------
         {
             // Place MSE reconstructions at original channel positions.
             float x_mse[128];
-            for (int j = 0; j < TQ_N_OUTLIER; j++) x_mse[out_pos[j]] = x_mse_out[j];
-            for (int j = 0; j < TQ_N_REGULAR; j++) x_mse[reg_pos[j]] = x_mse_reg[j];
+            for (int j = 0; j < TQ_N_OUT; j++) x_mse[out_pos[j]] = x_mse_out[j];
+            for (int j = 0; j < TQ_N_REG; j++) x_mse[reg_pos[j]] = x_mse_reg[j];
 
             // Unpack 128 sign bits → sign_vec.
             float sign_vec[128];
@@ -411,7 +411,7 @@ static void TQ_FN(dequant_impl)(const TQ_BLOCK * GGML_RESTRICT x,
 }
 
 // Public dequantize_row — exact names from ggml-quants.h.
-#if TQ_OUT_BITS == 3
+#if TQ_N_OUT == 32
 void dequantize_row_tq3_128(const block_tq3_128 * GGML_RESTRICT x,
                              float * GGML_RESTRICT y, int64_t k) {
     dequant_impl_tq3_128(x, y, k);
@@ -425,12 +425,19 @@ void dequantize_row_tq4_128(const block_tq4_128 * GGML_RESTRICT x,
 
 // ===========================================================================
 // QUERY PREPROCESSING — float → block_tq3_q_128
-// Emitted once (TQ3 include only) since the query block format is shared.
-// Public name: from_float_tq3_q_128
+//
+// Each type emits its own from_float function so the query block is filled
+// correctly for the corresponding vecdot.  A deployment uses either TQ3 or
+// TQ4 KV quantization on a given layer, not both simultaneously.
+//
+// The block_tq3_q_128 struct holds q_rot_out[64] (max outlier group size).
+// TQ3 fill: resolve at n_out=32 → writes q_rot_out[0..31], q_rot_reg[0..95]
+// TQ4 fill: resolve at n_out=64 → writes q_rot_out[0..63], q_rot_reg[0..63]
+//
+// Public names: from_float_tq3_q_128  /  from_float_tq4_q_128
 // ===========================================================================
-#if TQ_OUT_BITS == 3
-void from_float_tq3_q_128(const float * GGML_RESTRICT x,
-                           block_tq3_q_128 * GGML_RESTRICT y, int64_t k) {
+static void TQ_FN(from_float_impl)(const float * GGML_RESTRICT x,
+                                    block_tq3_q_128 * GGML_RESTRICT y, int64_t k) {
     assert(k % TQ_N == 0);
     const int64_t nb = k / TQ_N;
 
@@ -439,27 +446,28 @@ void from_float_tq3_q_128(const float * GGML_RESTRICT x,
         tq3_ensure_layer_matrices(layer);
     }
 
-    uint8_t out_pos[TQ_N_OUTLIER];
-    uint8_t reg_pos[TQ_N_REGULAR];
+    uint8_t out_pos[TQ_N_OUT];
+    uint8_t reg_pos[TQ_N_REG];
     const float * Pi_out, * Pi_reg, * S;
-    tq_resolve_layer(layer, out_pos, reg_pos, &Pi_out, &Pi_reg, &S);
+    tq_resolve_layer(layer, TQ_N_OUT, out_pos, reg_pos, &Pi_out, &Pi_reg, &S);
 
     for (int64_t i = 0; i < nb; i++) {
         const float       * xi = x + i * TQ_N;
         block_tq3_q_128   * qi = y + i;
 
         // Split query into outlier and regular sub-vectors.
-        float q_out[TQ_N_OUTLIER];
-        float q_reg[TQ_N_REGULAR];
-        for (int j = 0; j < TQ_N_OUTLIER; j++) q_out[j] = xi[out_pos[j]];
-        for (int j = 0; j < TQ_N_REGULAR; j++) q_reg[j] = xi[reg_pos[j]];
+        float q_out[TQ_N_OUT];
+        float q_reg[TQ_N_REG];
+        for (int j = 0; j < TQ_N_OUT; j++) q_out[j] = xi[out_pos[j]];
+        for (int j = 0; j < TQ_N_REG; j++) q_reg[j] = xi[reg_pos[j]];
 
-        // q_rot = Pi × q  (rotated domain for MSE dot product).
-        if (Pi_out) tq_matvec(Pi_out, q_out, qi->q_rot_out, TQ_N_OUTLIER, TQ_N_OUTLIER);
-        else        memcpy(qi->q_rot_out, q_out, TQ_N_OUTLIER * sizeof(float));
+        // q_rot_out = Pi_out × q_out  (rotated domain for MSE dot product).
+        if (Pi_out) tq_matvec(Pi_out, q_out, qi->q_rot_out, TQ_N_OUT, TQ_N_OUT);
+        else        memcpy(qi->q_rot_out, q_out, TQ_N_OUT * sizeof(float));
 
-        if (Pi_reg) tq_matvec(Pi_reg, q_reg, qi->q_rot_reg, TQ_N_REGULAR, TQ_N_REGULAR);
-        else        memcpy(qi->q_rot_reg, q_reg, TQ_N_REGULAR * sizeof(float));
+        // q_rot_reg = Pi_reg × q_reg
+        if (Pi_reg) tq_matvec(Pi_reg, q_reg, qi->q_rot_reg, TQ_N_REG, TQ_N_REG);
+        else        memcpy(qi->q_rot_reg, q_reg, TQ_N_REG * sizeof(float));
 
         // q_proj = S × query[128]  (UNIFIED — full 128-dim query for QJL dot product).
         if (S) tq_matvec(S, xi, qi->q_proj, 128, 128);
@@ -467,7 +475,19 @@ void from_float_tq3_q_128(const float * GGML_RESTRICT x,
                static int _w; if(!_w++){fprintf(stderr,"WARN: from_float S=NULL layer=%d\n",layer);} }
     }
 }
-#endif // TQ_OUT_BITS == 3
+
+// Public from_float entry points.
+#if TQ_N_OUT == 32
+void from_float_tq3_q_128(const float * GGML_RESTRICT x,
+                           block_tq3_q_128 * GGML_RESTRICT y, int64_t k) {
+    from_float_impl_tq3_128(x, y, k);
+}
+#else
+void from_float_tq4_q_128(const float * GGML_RESTRICT x,
+                           block_tq3_q_128 * GGML_RESTRICT y, int64_t k) {
+    from_float_impl_tq4_128(x, y, k);
+}
+#endif
 
 // ===========================================================================
 // VEC-DOT — fused dequant + dot product, no full float reconstruction.
@@ -509,29 +529,23 @@ static void TQ_FN(vec_dot_impl)(int n, float * GGML_RESTRICT s, size_t bs,
 
         // ---- Outlier MSE (rotated domain) ----------------------------------
         {
-            uint8_t out_idx[TQ_N_OUTLIER];
-#if TQ_OUT_BITS == 3
-            tq_unpack_3bit(xi->out_idx, out_idx);
-#else
-            for (int j = 0; j < TQ_N_OUTLIER/2; j++) {
-                out_idx[2*j]   = xi->out_idx[j] & 0xf;
-                out_idx[2*j+1] = (xi->out_idx[j] >> 4) & 0xf;
-            }
-#endif
+            uint8_t out_idx[TQ_N_OUT];
+            tq_unpack_3bit(xi->out_idx, out_idx, TQ_N_OUT);
+
             float dot = 0.0f;
-            for (int j = 0; j < TQ_N_OUTLIER; j++)
+            for (int j = 0; j < TQ_N_OUT; j++)
                 dot += TQ_OUT_CB[out_idx[j]] * qi->q_rot_out[j];
             sum += norm_out * dot;
         }
 
         // ---- Regular MSE (rotated domain) ----------------------------------
         {
-            uint8_t reg_idx[TQ_N_REGULAR];
+            uint8_t reg_idx[TQ_N_REG];
 #if TQ_REG_BITS == 1
-            for (int j = 0; j < TQ_N_REGULAR; j++)
+            for (int j = 0; j < TQ_N_REG; j++)
                 reg_idx[j] = (xi->reg_idx[j/8] >> (j%8)) & 1;
 #else
-            for (int j = 0; j < TQ_N_REGULAR/4; j++) {
+            for (int j = 0; j < TQ_N_REG/4; j++) {
                 uint8_t b = xi->reg_idx[j];
                 reg_idx[4*j]   =  b       & 3;
                 reg_idx[4*j+1] = (b >> 2) & 3;
@@ -540,7 +554,7 @@ static void TQ_FN(vec_dot_impl)(int n, float * GGML_RESTRICT s, size_t bs,
             }
 #endif
             float dot = 0.0f;
-            for (int j = 0; j < TQ_N_REGULAR; j++)
+            for (int j = 0; j < TQ_N_REG; j++)
                 dot += TQ_REG_CB[reg_idx[j]] * qi->q_rot_reg[j];
             sum += norm_reg * dot;
         }
@@ -560,7 +574,7 @@ static void TQ_FN(vec_dot_impl)(int n, float * GGML_RESTRICT s, size_t bs,
 }
 
 // Public vec_dot entry points — exact names from ggml-quants.h.
-#if TQ_OUT_BITS == 3
+#if TQ_N_OUT == 32
 void ggml_vec_dot_tq3_q_128(int n, float * GGML_RESTRICT s, size_t bs,
                               const void * GGML_RESTRICT vx, size_t bx,
                               const void * GGML_RESTRICT vy, size_t by, int nrc) {
@@ -584,6 +598,8 @@ void ggml_vec_dot_tq4_q_128(int n, float * GGML_RESTRICT s, size_t bs,
 #undef TQ_BLOCK
 #undef TQ_Q_BLOCK
 #undef TQ_N
+#undef TQ_N_OUT
+#undef TQ_N_REG
 #undef TQ_OUT_BITS
 #undef TQ_REG_BITS
 #undef TQ_OUT_CB
