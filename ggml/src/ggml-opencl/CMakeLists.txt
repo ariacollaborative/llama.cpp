@@ -94,6 +94,7 @@ set(GGML_OPENCL_KERNELS
     mul_mv_q6_k_f32_flat
     mul_mv_q8_0_f32
     mul_mv_q8_0_f32_flat
+    mul_mv_tq3_f32
     mul_mv_mxfp4_f32
     mul_mv_mxfp4_f32_flat
     mul_mv_id_q4_0_f32_8x_flat
@@ -127,6 +128,7 @@ set(GGML_OPENCL_KERNELS
     rope
     scale
     set_rows
+    set_rows_tq3
     sigmoid
     silu
     softmax_4_f32
