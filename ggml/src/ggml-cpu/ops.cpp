@@ -4939,6 +4939,7 @@ static void ggml_compute_forward_set_rows_f32(
             layer = atoi(p + 2);
         }
         tq3_set_layer(layer);
+        fprintf(stderr, "TQ3_LAYER dst_name=\"%s\" layer=%d\n", dst->name, layer);
     }
 
     ggml_from_float_t const from_float = ggml_get_type_traits_cpu(dst->type)->from_float;

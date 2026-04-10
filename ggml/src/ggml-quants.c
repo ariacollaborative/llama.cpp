@@ -2449,7 +2449,7 @@ static void tq3_ensure_layer_matrices(int layer) {
 // Outlier calibration
 static float tq3_channel_accum[TQ_MAX_LAYERS][128];
 static int   tq3_calib_count[TQ_MAX_LAYERS];
-#define TQ_CALIB_TOKENS 32
+#define TQ_CALIB_TOKENS 1
 
 static void tq3_calibrate_outliers(int layer, const float * x, int64_t k) {
     if (layer < 0 || layer >= TQ_MAX_LAYERS) return;
@@ -2473,6 +2473,7 @@ static void tq3_calibrate_outliers(int layer, const float * x, int64_t k) {
             }
             for (int j = 0; j < TQ_N_OUTLIER; j++) tq3_layers[layer].outlier_ch[j] = order[j];
             tq3_layers[layer].calibrated = true;
+            fprintf(stderr, "TQ3_CALIB layer=%d outliers=[%d,%d,%d,%d,...] count=%d\n", layer, tq3_layers[layer].outlier_ch[0], tq3_layers[layer].outlier_ch[1], tq3_layers[layer].outlier_ch[2], tq3_layers[layer].outlier_ch[3], tq3_calib_count[layer]);
         }
     }
 }
