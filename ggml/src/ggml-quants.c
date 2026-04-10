@@ -2452,6 +2452,8 @@ static int   tq3_calib_count[TQ_MAX_LAYERS];
 #define TQ_CALIB_TOKENS 1
 
 static void tq3_calibrate_outliers(int layer, const float * x, int64_t k) {
+    (void)layer; (void)x; (void)k;
+    return; // DISABLED: use fixed default mask [0-31] for consistency
     if (layer < 0 || layer >= TQ_MAX_LAYERS) return;
     if (tq3_layers[layer].calibrated) return;
     int nb = k / 128;
