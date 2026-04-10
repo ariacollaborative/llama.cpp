@@ -266,43 +266,53 @@ typedef struct {
 } block_tq2_0;
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
 
-// --- TQ3: 3.25-bit KV cache quantization (TurboQuant, arXiv:2504.19874) ---
+// --- TurboQuant mixed-precision KV cache quantization (arXiv:2504.19874) ---
 
-// 128-element block (52 bytes = 3.25 bpv)
-#define QK_TQ3_128 128
+// TurboQuant mixed-precision constants
+#define QK_TQ3_128     128
+#define QK_TQ4_128     128
+#define QK_TQ3_Q_128   128
+
+#define TQ_N_OUTLIER    32
+#define TQ_N_REGULAR    96
+#define TQ_QJL_OUT      32
+#define TQ_QJL_REG      96
+#define TQ_MAX_LAYERS  128
+
+// TQ3: TurboQuant b=3, 2.5-bit effective (32 outlier @ 4bits + 96 regular @ 2bits)
 typedef struct {
-    uint8_t   idx[QK_TQ3_128 / 4];   // 2-bit MSE indices, 4 per byte (32 bytes)
-    uint8_t   qjl[QK_TQ3_128 / 8];   // QJL sign bits, 8 per byte (16 bytes)
-    ggml_half norm;                    // fp16 vector L2 norm
-    ggml_half res_norm;                // fp16 residual norm
+    uint8_t out_idx[12];          // 32 x 3-bit MSE indices, tight packed
+    uint8_t out_qjl[TQ_N_OUTLIER/8]; // 32 x 1-bit QJL signs (4 bytes)
+    uint8_t reg_idx[TQ_N_REGULAR/8]; // 96 x 1-bit MSE indices (12 bytes)
+    uint8_t reg_qjl[TQ_N_REGULAR/8]; // 96 x 1-bit QJL signs (12 bytes)
+    ggml_half out_norm;
+    ggml_half out_resnorm;
+    ggml_half reg_norm;
+    ggml_half reg_resnorm;
 } block_tq3_128;
-static_assert(sizeof(block_tq3_128) == QK_TQ3_128/4 + QK_TQ3_128/8 + 2*sizeof(ggml_half),
-              "wrong tq3_128 block size");
+static_assert(sizeof(block_tq3_128) == 48, "wrong tq3_128 block size");
 
+// TQ4: TurboQuant b=4, 3.5-bit effective (32 outlier @ 5bits + 96 regular @ 3bits)
 typedef struct {
-    float q_rot[QK_TQ3_128];     // Hadamard-rotated query
-    float q_proj[QK_TQ3_128];    // Gaussian-projected query (S*q)
+    uint8_t out_idx[TQ_N_OUTLIER/2]; // 32 x 4-bit MSE indices (16 bytes)
+    uint8_t out_qjl[TQ_N_OUTLIER/8]; // 32 x 1-bit QJL signs (4 bytes)
+    uint8_t reg_idx[TQ_N_REGULAR/4]; // 96 x 2-bit MSE indices (24 bytes)
+    uint8_t reg_qjl[TQ_N_REGULAR/8]; // 96 x 1-bit QJL signs (12 bytes)
+    ggml_half out_norm;
+    ggml_half out_resnorm;
+    ggml_half reg_norm;
+    ggml_half reg_resnorm;
+} block_tq4_128;
+static_assert(sizeof(block_tq4_128) == 64, "wrong tq4_128 block size");
+
+// Query block (shared by TQ3 and TQ4)
+typedef struct {
+    float q_rot_out[TQ_N_OUTLIER];   // 32 floats
+    float q_rot_reg[TQ_N_REGULAR];   // 96 floats
+    float q_proj_out[TQ_QJL_OUT];    // 32 floats
+    float q_proj_reg[TQ_QJL_REG];    // 96 floats
 } block_tq3_q_128;
-static_assert(sizeof(block_tq3_q_128) == 2 * QK_TQ3_128 * sizeof(float),
-              "wrong tq3_q_128 block size");
-
-// 256-element block (100 bytes = 3.125 bpv)
-#define QK_TQ3_256 256
-typedef struct {
-    uint8_t   idx[QK_TQ3_256 / 4];   // 2-bit MSE indices (64 bytes)
-    uint8_t   qjl[QK_TQ3_256 / 8];   // QJL sign bits (32 bytes)
-    ggml_half norm;
-    ggml_half res_norm;
-} block_tq3_256;
-static_assert(sizeof(block_tq3_256) == QK_TQ3_256/4 + QK_TQ3_256/8 + 2*sizeof(ggml_half),
-              "wrong tq3_256 block size");
-
-typedef struct {
-    float q_rot[QK_TQ3_256];
-    float q_proj[QK_TQ3_256];
-} block_tq3_q_256;
-static_assert(sizeof(block_tq3_q_256) == 2 * QK_TQ3_256 * sizeof(float),
-              "wrong tq3_q_256 block size");
+static_assert(sizeof(block_tq3_q_128) == 1024, "wrong tq3_q_128 block size");
 
 //
 // Super-block quantization structures
