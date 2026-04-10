@@ -105,6 +105,7 @@ static void tq_resolve_layer(int layer,
                              const float ** S_out,  const float ** S_reg) {
     uint8_t is_out[128];
     if (layer >= 0 && layer < TQ_MAX_LAYERS) {
+        tq3_ensure_layer_matrices(layer);
         if (tq3_layers[layer].calibrated) {
             tq_build_outlier_mask(tq3_layers[layer].outlier_ch, is_out);
         } else {
