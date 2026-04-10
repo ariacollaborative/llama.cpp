@@ -1,6 +1,7 @@
 #include "ops.h"
 
 #include "ggml-cpu.h"
+#include "ggml-quants.h"
 #include "ggml-impl.h"
 #include "binary-ops.h"
 #include "simd-gemm.h"
@@ -4929,6 +4930,16 @@ static void ggml_compute_forward_set_rows_f32(
     // row range for this thread
     const int64_t ir0 = dr*ith;
     const int64_t ir1 = std::min(ir0 + dr, nr);
+
+    // Set TQ3/TQ4 layer context for per-layer outlier detection
+    if (dst->type == GGML_TYPE_TQ3_128 || dst->type == GGML_TYPE_TQ4_128) {
+        int layer = -1;
+        const char * p = strstr(dst->name, "_l");
+        if (p) {
+            layer = atoi(p + 2);
+        }
+        tq3_set_layer(layer);
+    }
 
     ggml_from_float_t const from_float = ggml_get_type_traits_cpu(dst->type)->from_float;
 
