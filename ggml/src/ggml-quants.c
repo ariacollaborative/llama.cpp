@@ -2477,6 +2477,55 @@ static void tq3_calibrate_outliers(int layer, const float * x, int64_t k) {
     }
 }
 
+// Weight-based outlier detection: analyze W_K column norms.
+// Call once per layer during model loading — before any inference.
+// wk is dequantized as [n_output_dims, n_input_dims] row-major.
+// Each row j (j=0..n_output_dims-1) is one output column of the weight matrix.
+// n_output_dims = n_head_kv * head_dim.  We compute per-head-dim row norms.
+void tq3_init_outliers_from_weights(int layer, const float * wk, int n_output_dims, int n_input_dims, int n_head_kv) {
+    if (layer < 0 || layer >= TQ_MAX_LAYERS) return;
+    if (tq3_layers[layer].calibrated) return;
+    int head_dim = n_output_dims / n_head_kv;
+    if (head_dim != 128) return;
+
+    // Compute L2 norm of each row (= each output column of W_K)
+    float row_norms[256];
+    for (int j = 0; j < n_output_dims; j++) {
+        float norm2 = 0.0f;
+        for (int i = 0; i < n_input_dims; i++) {
+            float v = wk[j * n_input_dims + i];
+            norm2 += v * v;
+        }
+        row_norms[j] = sqrtf(norm2);
+    }
+
+    // Average norms across KV heads for each head dimension
+    float dim_norms[128] = {0};
+    for (int h = 0; h < n_head_kv; h++)
+        for (int d = 0; d < 128; d++)
+            dim_norms[d] += row_norms[h * 128 + d];
+    for (int d = 0; d < 128; d++) dim_norms[d] /= n_head_kv;
+
+    // Sort by norm descending, top 32 = outliers
+    uint8_t order[128];
+    for (int j = 0; j < 128; j++) order[j] = (uint8_t)j;
+    for (int i = 1; i < 128; i++) {
+        uint8_t key = order[i];
+        float key_val = dim_norms[key];
+        int j = i - 1;
+        while (j >= 0 && dim_norms[order[j]] < key_val) {
+            order[j + 1] = order[j]; j--;
+        }
+        order[j + 1] = key;
+    }
+    for (int j = 0; j < TQ_N_OUTLIER; j++)
+        tq3_layers[layer].outlier_ch[j] = order[j];
+    tq3_layers[layer].calibrated = true;
+    fprintf(stderr, "TQ3_WEIGHT layer=%d outliers=[%d,%d,%d,%d,...] max=%.2f min=%.2f ratio=%.1f\n",
+        layer, order[0], order[1], order[2], order[3],
+        dim_norms[order[0]], dim_norms[order[127]], dim_norms[order[0]]/dim_norms[order[127]]);
+}
+
 // --- TQ3 (b=3, 2.5-bit) ---
 #define TQ_NAME         tq3_128
 #define TQ_BLOCK        block_tq3_128

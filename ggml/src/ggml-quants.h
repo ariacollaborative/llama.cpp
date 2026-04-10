@@ -87,6 +87,7 @@ GGML_API size_t quantize_tq2_0(const float * GGML_RESTRICT src, void * GGML_REST
 
 // TQ3/TQ4 layer context
 void tq3_set_layer(int layer);
+void tq3_init_outliers_from_weights(int layer, const float * wk, int rows, int cols, int n_head_kv);
 int  tq3_get_layer(void);
 
 // TQ3 functions

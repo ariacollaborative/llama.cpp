@@ -1,6 +1,9 @@
 #include "llama-kv-cache.h"
 
 #include "llama-impl.h"
+extern "C" {
+    void tq3_init_outliers_from_weights(int layer, const float * wk, int rows, int cols, int n_head_kv);
+}
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
@@ -290,6 +293,44 @@ llama_kv_cache::llama_kv_cache(
 
     LLAMA_LOG_INFO("%s: attn_rot_k = %d\n", __func__, attn_rot_k);
     LLAMA_LOG_INFO("%s: attn_rot_v = %d\n", __func__, attn_rot_v);
+
+    // Initialize TQ3/TQ4 outlier channels from W_K weight matrix column norms
+    if (type_k == GGML_TYPE_TQ3_128 || type_k == GGML_TYPE_TQ4_128) {
+        const int n_layer = hparams.n_layer;
+        const int n_embd = hparams.n_embd;
+        const int n_embd_k_gqa = hparams.n_embd_k_gqa();
+        const int n_head_kv = hparams.n_head_kv();
+
+        for (int il = 0; il < n_layer; il++) {
+            const ggml_tensor * wk = model.layers[il].wk;
+            if (!wk || !wk->data) continue;
+
+            // W_K tensor layout: ne[0]=n_embd (contiguous), ne[1]=n_embd_k_gqa
+            // Mathematical column j (output dim) = ggml row j
+            // Dequantize each ggml row, compute norm = output column norm
+            const int64_t n_row = wk->ne[1];  // n_embd_k_gqa = 256
+            const int64_t n_col = wk->ne[0];  // n_embd = 2048
+            std::vector<float> wk_f32(n_row * n_col);
+
+            auto to_float = ggml_get_type_traits(wk->type)->to_float;
+            if (to_float) {
+                for (int64_t r = 0; r < n_row; r++) {
+                    const void * row_data = (const char *)wk->data + r * wk->nb[1];
+                    to_float(row_data, wk_f32.data() + r * n_col, n_col);
+                }
+            } else {
+                memcpy(wk_f32.data(), wk->data, n_row * n_col * sizeof(float));
+            }
+
+            if (il == 0) {
+                LLAMA_LOG_INFO("TQ3_DBG wk type=%s ne=[%lld,%lld] nb=[%lld,%lld] first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                    ggml_type_name(wk->type), (long long)wk->ne[0], (long long)wk->ne[1],
+                    (long long)wk->nb[0], (long long)wk->nb[1],
+                    wk_f32[0], wk_f32[1], wk_f32[2], wk_f32[3], wk_f32[4]);
+            }
+            tq3_init_outliers_from_weights(il, wk_f32.data(), (int)n_row, (int)n_col, n_head_kv);
+        }
+    }
 
     // pre-compute the haramard matrices and keep them in host memory
     // TODO: in the future, we can make copies in the backend buffers to avoid host -> device transfers

@@ -463,7 +463,8 @@ void from_float_tq3_q_128(const float * GGML_RESTRICT x,
 
         // q_proj = S × query[128]  (UNIFIED — full 128-dim query for QJL dot product).
         if (S) tq_matvec(S, xi, qi->q_proj, 128, 128);
-        else   memcpy(qi->q_proj, xi, 128 * sizeof(float));
+        else { memcpy(qi->q_proj, xi, 128 * sizeof(float));
+               static int _w; if(!_w++){fprintf(stderr,"WARN: from_float S=NULL layer=%d\n",layer);} }
     }
 }
 #endif // TQ_OUT_BITS == 3
