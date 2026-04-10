@@ -428,11 +428,10 @@ extern "C" {
         // GGML_TYPE_IQ4_NL_8_8 = 38,
         GGML_TYPE_MXFP4     = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4     = 40, // NVFP4 (4 blocks, E4M3 scale)
-        GGML_TYPE_TQ3_128   = 41, // TurboQuant 3.25-bit, 128-element blocks (arXiv:2504.19874)
-        GGML_TYPE_TQ3_Q_128 = 42, // TQ3-128 precomputed query
-        GGML_TYPE_TQ3_256   = 43, // TurboQuant 3.25-bit, 256-element blocks
-        GGML_TYPE_TQ3_Q_256 = 44, // TQ3-256 precomputed query
-        GGML_TYPE_COUNT     = 45,
+        GGML_TYPE_TQ3_128   = 41, // TurboQuant b=3, 2.5-bit mixed precision
+        GGML_TYPE_TQ4_128   = 42, // TurboQuant b=4, 3.5-bit mixed precision
+        GGML_TYPE_TQ3_Q_128 = 43, // TurboQuant query preprocessing block
+        GGML_TYPE_COUNT     = 44,
     };
 
     // precision
