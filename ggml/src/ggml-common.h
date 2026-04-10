@@ -266,6 +266,44 @@ typedef struct {
 } block_tq2_0;
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
 
+// --- TQ3: 3.25-bit KV cache quantization (TurboQuant, arXiv:2504.19874) ---
+
+// 128-element block (52 bytes = 3.25 bpv)
+#define QK_TQ3_128 128
+typedef struct {
+    uint8_t   idx[QK_TQ3_128 / 4];   // 2-bit MSE indices, 4 per byte (32 bytes)
+    uint8_t   qjl[QK_TQ3_128 / 8];   // QJL sign bits, 8 per byte (16 bytes)
+    ggml_half norm;                    // fp16 vector L2 norm
+    ggml_half res_norm;                // fp16 residual norm
+} block_tq3_128;
+static_assert(sizeof(block_tq3_128) == QK_TQ3_128/4 + QK_TQ3_128/8 + 2*sizeof(ggml_half),
+              "wrong tq3_128 block size");
+
+typedef struct {
+    float q_rot[QK_TQ3_128];     // Hadamard-rotated query
+    float q_proj[QK_TQ3_128];    // Gaussian-projected query (S*q)
+} block_tq3_q_128;
+static_assert(sizeof(block_tq3_q_128) == 2 * QK_TQ3_128 * sizeof(float),
+              "wrong tq3_q_128 block size");
+
+// 256-element block (100 bytes = 3.125 bpv)
+#define QK_TQ3_256 256
+typedef struct {
+    uint8_t   idx[QK_TQ3_256 / 4];   // 2-bit MSE indices (64 bytes)
+    uint8_t   qjl[QK_TQ3_256 / 8];   // QJL sign bits (32 bytes)
+    ggml_half norm;
+    ggml_half res_norm;
+} block_tq3_256;
+static_assert(sizeof(block_tq3_256) == QK_TQ3_256/4 + QK_TQ3_256/8 + 2*sizeof(ggml_half),
+              "wrong tq3_256 block size");
+
+typedef struct {
+    float q_rot[QK_TQ3_256];
+    float q_proj[QK_TQ3_256];
+} block_tq3_q_256;
+static_assert(sizeof(block_tq3_q_256) == 2 * QK_TQ3_256 * sizeof(float),
+              "wrong tq3_q_256 block size");
+
 //
 // Super-block quantization structures
 //

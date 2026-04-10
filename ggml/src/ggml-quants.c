@@ -2336,6 +2336,126 @@ void dequantize_row_tq2_0(const block_tq2_0 * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
+// ====================== TQ3: 3.25-bit KV cache quantization =====================
+
+static const float tq3_codebook[4] = {
+    -0.13304020f, -0.03999094f, 0.03999094f, 0.13304020f
+};
+static const float tq3_boundaries[3] = { -0.08651557f, 0.0f, 0.08651557f };
+
+// xorshift64 RNG (shared, used for per-size init)
+static uint64_t tq3_rng_state;
+static void tq3_rng_seed(uint64_t s) { tq3_rng_state = s; }
+static double tq3_rng_next(void) {
+    tq3_rng_state ^= tq3_rng_state << 13;
+    tq3_rng_state ^= tq3_rng_state >> 7;
+    tq3_rng_state ^= tq3_rng_state << 17;
+    return (double)(tq3_rng_state & 0xFFFFFFFFFFFFULL) / (double)0xFFFFFFFFFFFFULL;
+}
+static double tq3_gaussian(void) {
+    double u1 = tq3_rng_next(), u2 = tq3_rng_next();
+    if (u1 < 1e-15) u1 = 1e-15;
+    return sqrt(-2.0 * log(u1)) * cos(6.283185307179586 * u2);
+}
+
+// Per-size state
+static int   tq3_inited_128 = 0;
+static float tq3_signs_128[QK_TQ3_128];
+static float tq3_S_128[QK_TQ3_128][QK_TQ3_128];
+
+static int   tq3_inited_256 = 0;
+static float tq3_signs_256[QK_TQ3_256];
+static float tq3_S_256[QK_TQ3_256][QK_TQ3_256];
+
+static void tq3_ensure_init_128(void) {
+    if (tq3_inited_128) return;
+    uint64_t sign_seed = 42;
+    for (int j = 0; j < QK_TQ3_128; j++) {
+        sign_seed ^= sign_seed << 13; sign_seed ^= sign_seed >> 7; sign_seed ^= sign_seed << 17;
+        tq3_signs_128[j] = (sign_seed & 1) ? 1.0f : -1.0f;
+    }
+    tq3_rng_seed(1042);
+    for (int i = 0; i < QK_TQ3_128; i++)
+        for (int j = 0; j < QK_TQ3_128; j++)
+            tq3_S_128[i][j] = (float)tq3_gaussian();
+    tq3_inited_128 = 1;
+}
+
+static void tq3_ensure_init_256(void) {
+    if (tq3_inited_256) return;
+    uint64_t sign_seed = 42;
+    for (int j = 0; j < QK_TQ3_256; j++) {
+        sign_seed ^= sign_seed << 13; sign_seed ^= sign_seed >> 7; sign_seed ^= sign_seed << 17;
+        tq3_signs_256[j] = (sign_seed & 1) ? 1.0f : -1.0f;
+    }
+    tq3_rng_seed(1042);
+    for (int i = 0; i < QK_TQ3_256; i++)
+        for (int j = 0; j < QK_TQ3_256; j++)
+            tq3_S_256[i][j] = (float)tq3_gaussian();
+    tq3_inited_256 = 1;
+}
+
+// FWHT and rotation helpers (parameterized by d)
+static void tq3_fwht(float *x, int d) {
+    for (int h = 1; h < d; h *= 2)
+        for (int i = 0; i < d; i += h*2)
+            for (int j = i; j < i+h; j++) {
+                float a = x[j], b = x[j+h];
+                x[j] = a+b; x[j+h] = a-b;
+            }
+    float s = 1.0f / sqrtf((float)d);
+    for (int j = 0; j < d; j++) x[j] *= s;
+}
+
+static void tq3_rotate(float *out, const float *x, const float *signs, int d) {
+    for (int j = 0; j < d; j++) out[j] = signs[j] * x[j];
+    tq3_fwht(out, d);
+}
+
+static void tq3_unrotate(float *out, const float *y, const float *signs, int d) {
+    for (int j = 0; j < d; j++) out[j] = y[j];
+    tq3_fwht(out, d);
+    for (int j = 0; j < d; j++) out[j] *= signs[j];
+}
+
+// Instantiate TQ3 for 128-element blocks
+#define TQ3_N        QK_TQ3_128
+#define TQ3_SUFFIX   _128
+#define TQ3_SUFFIX_R _128_ref
+#define TQ3_SIGNS    tq3_signs_128
+#define TQ3_S        tq3_S_128
+#define TQ3_INIT     tq3_ensure_init_128
+#define TQ3_BLOCK    block_tq3_128
+#define TQ3_QBLOCK   block_tq3_q_128
+#include "tq3_impl.inc"
+#undef TQ3_N
+#undef TQ3_SUFFIX
+#undef TQ3_SUFFIX_R
+#undef TQ3_SIGNS
+#undef TQ3_S
+#undef TQ3_INIT
+#undef TQ3_BLOCK
+#undef TQ3_QBLOCK
+
+// Instantiate TQ3 for 256-element blocks
+#define TQ3_N        QK_TQ3_256
+#define TQ3_SUFFIX   _256
+#define TQ3_SUFFIX_R _256_ref
+#define TQ3_SIGNS    tq3_signs_256
+#define TQ3_S        tq3_S_256
+#define TQ3_INIT     tq3_ensure_init_256
+#define TQ3_BLOCK    block_tq3_256
+#define TQ3_QBLOCK   block_tq3_q_256
+#include "tq3_impl.inc"
+#undef TQ3_N
+#undef TQ3_SUFFIX
+#undef TQ3_SUFFIX_R
+#undef TQ3_SIGNS
+#undef TQ3_S
+#undef TQ3_INIT
+#undef TQ3_BLOCK
+#undef TQ3_QBLOCK
+
 // ====================== "True" 2-bit (de)-quantization
 
 void dequantize_row_iq2_xxs(const block_iq2_xxs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
