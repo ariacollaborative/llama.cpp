@@ -2336,142 +2336,176 @@ void dequantize_row_tq2_0(const block_tq2_0 * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
-// ====================== TQ3: 3.25-bit KV cache quantization =====================
+// ====================== TQ3/TQ4: KV cache quantization =====================
 
-static const float tq3_codebook[4] = {
-    -0.13304020f, -0.03999094f, 0.03999094f, 0.13304020f
+// Thread-local layer context
+static _Thread_local int tq3_current_layer = -1;
+void tq3_set_layer(int layer) { tq3_current_layer = layer; }
+int  tq3_get_layer(void)      { return tq3_current_layer; }
+
+// Per-layer state
+static struct {
+    uint8_t outlier_ch[TQ_N_OUTLIER];
+    bool calibrated;
+    float Pi_out[TQ_N_OUTLIER][TQ_N_OUTLIER];
+    float Pi_reg[TQ_N_REGULAR][TQ_N_REGULAR];
+    float S_out[TQ_N_OUTLIER][TQ_N_OUTLIER];
+    float S_reg[TQ_N_REGULAR][TQ_N_REGULAR];
+    bool matrices_initialized;
+} tq3_layers[TQ_MAX_LAYERS];
+
+// TQ3 outlier: d=32, b=3 (8 centroids)
+static const float tq3_cb_out[8] = {
+    -0.3662682415f, -0.2324605662f, -0.1317560962f, -0.0428515154f,
+     0.0428515154f,  0.1317560962f,  0.2324605662f,  0.3662682415f
 };
-static const float tq3_boundaries[3] = { -0.08651557f, 0.0f, 0.08651557f };
+static const float tq3_bd_out[7] = {
+    -0.2993644038f, -0.1821083312f, -0.0873038058f, 0.0f,
+     0.0873038058f,  0.1821083312f,  0.2993644038f
+};
 
-// xorshift64 RNG (shared, used for per-size init)
+// TQ3 regular: d=96, b=1 (2 centroids)
+static const float tq3_cb_reg[2] = { -0.0816460916f, 0.0816460916f };
+static const float tq3_bd_reg[1] = { 0.0f };
+
+// TQ4 outlier: d=32, b=4 (16 centroids)
+static const float tq4_cb_out[16] = {
+    -0.4533721873f, -0.3498558992f, -0.2764913899f, -0.2161194412f,
+    -0.1628573723f, -0.1138475668f, -0.0673934271f, -0.0223187439f,
+     0.0223187439f,  0.0673934271f,  0.1138475668f,  0.1628573723f,
+     0.2161194412f,  0.2764913899f,  0.3498558992f,  0.4533721873f
+};
+static const float tq4_bd_out[15] = {
+    -0.4016140432f, -0.3131736446f, -0.2463054156f, -0.1894884068f,
+    -0.1383524696f, -0.0906204970f, -0.0448560855f, 0.0f,
+     0.0448560855f,  0.0906204970f,  0.1383524696f,  0.1894884068f,
+     0.2463054156f,  0.3131736446f,  0.4016140432f
+};
+
+// TQ4 regular: d=96, b=2 (4 centroids)
+static const float tq4_cb_reg[4] = {
+    -0.1534455136f, -0.0461670285f, 0.0461670285f, 0.1534455136f
+};
+static const float tq4_bd_reg[3] = { -0.0998062711f, 0.0f, 0.0998062711f };
+
+// RNG
 static uint64_t tq3_rng_state;
-static void tq3_rng_seed(uint64_t s) { tq3_rng_state = s; }
-static double tq3_rng_next(void) {
+
+static void tq3_rng_seed(uint64_t seed) { tq3_rng_state = seed; }
+
+static uint64_t tq3_xor64(void) {
     tq3_rng_state ^= tq3_rng_state << 13;
     tq3_rng_state ^= tq3_rng_state >> 7;
     tq3_rng_state ^= tq3_rng_state << 17;
-    return (double)(tq3_rng_state & 0xFFFFFFFFFFFFULL) / (double)0xFFFFFFFFFFFFULL;
-}
-static double tq3_gaussian(void) {
-    double u1 = tq3_rng_next(), u2 = tq3_rng_next();
-    if (u1 < 1e-15) u1 = 1e-15;
-    return sqrt(-2.0 * log(u1)) * cos(6.283185307179586 * u2);
+    return tq3_rng_state;
 }
 
-// Per-size state
-static int   tq3_inited_128 = 0;
-static float tq3_signs_128[QK_TQ3_128];
-static float tq3_S_128[QK_TQ3_128][QK_TQ3_128];
+static double tq3_rng_uniform(void) {
+    return (double)(tq3_xor64() & 0xFFFFFFFFFFFFULL) / (double)0xFFFFFFFFFFFFULL;
+}
 
-static int   tq3_inited_256 = 0;
-static float tq3_signs_256[QK_TQ3_256];
-static float tq3_S_256[QK_TQ3_256][QK_TQ3_256];
+static double tq3_rng_gaussian(void) {
+    double u1 = tq3_rng_uniform();
+    double u2 = tq3_rng_uniform();
+    if (u1 < 1e-30) u1 = 1e-30;
+    return sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
+}
 
-static void tq3_ensure_init_128(void) {
-    if (tq3_inited_128) return;
-    uint64_t sign_seed = 42;
-    for (int j = 0; j < QK_TQ3_128; j++) {
-        sign_seed ^= sign_seed << 13; sign_seed ^= sign_seed >> 7; sign_seed ^= sign_seed << 17;
-        tq3_signs_128[j] = (sign_seed & 1) ? 1.0f : -1.0f;
-    }
-    tq3_rng_seed(1042);
-    for (int i = 0; i < QK_TQ3_128; i++)
-        for (int j = 0; j < QK_TQ3_128; j++)
-            tq3_S_128[i][j] = (float)tq3_gaussian();
-    // Orthogonalize rows via Modified Gram-Schmidt
-    // Step 1: orthogonalize to unit vectors
-    for (int i = 0; i < QK_TQ3_128; i++) {
+// QR via Modified Gram-Schmidt
+static void tq3_generate_rotation(float * Pi, int d, uint64_t seed) {
+    tq3_rng_seed(seed);
+    for (int i = 0; i < d * d; i++) Pi[i] = (float)tq3_rng_gaussian();
+    for (int i = 0; i < d; i++) {
         for (int k = 0; k < i; k++) {
             float dot = 0.0f;
-            for (int j = 0; j < QK_TQ3_128; j++) dot += tq3_S_128[i][j] * tq3_S_128[k][j];
-            for (int j = 0; j < QK_TQ3_128; j++) tq3_S_128[i][j] -= dot * tq3_S_128[k][j];
+            for (int j = 0; j < d; j++) dot += Pi[i*d+j] * Pi[k*d+j];
+            for (int j = 0; j < d; j++) Pi[i*d+j] -= dot * Pi[k*d+j];
         }
         float norm = 0.0f;
-        for (int j = 0; j < QK_TQ3_128; j++) norm += tq3_S_128[i][j] * tq3_S_128[i][j];
+        for (int j = 0; j < d; j++) norm += Pi[i*d+j] * Pi[i*d+j];
         norm = sqrtf(norm);
-        if (norm > 1e-10f) {
-            float inv = 1.0f / norm;
-            for (int j = 0; j < QK_TQ3_128; j++) tq3_S_128[i][j] *= inv;
+        if (norm > 1e-10f) for (int j = 0; j < d; j++) Pi[i*d+j] /= norm;
+    }
+}
+
+// Raw Gaussian S (no orthogonalization)
+static void tq3_generate_s_matrix(float * S, int d, uint64_t seed) {
+    tq3_rng_seed(seed);
+    for (int i = 0; i < d * d; i++) S[i] = (float)tq3_rng_gaussian();
+}
+
+static void tq3_ensure_layer_matrices(int layer) {
+    if (layer < 0 || layer >= TQ_MAX_LAYERS) return;
+    if (tq3_layers[layer].matrices_initialized) return;
+    uint64_t rot_seed = 42 + (uint64_t)layer * 7;
+    uint64_t s_seed   = 1042 + (uint64_t)layer * 7;
+    tq3_generate_rotation(&tq3_layers[layer].Pi_out[0][0], TQ_N_OUTLIER, rot_seed);
+    tq3_generate_rotation(&tq3_layers[layer].Pi_reg[0][0], TQ_N_REGULAR, rot_seed + 1);
+    tq3_generate_s_matrix(&tq3_layers[layer].S_out[0][0],  TQ_N_OUTLIER, s_seed);
+    tq3_generate_s_matrix(&tq3_layers[layer].S_reg[0][0],  TQ_N_REGULAR, s_seed + 1);
+    tq3_layers[layer].matrices_initialized = true;
+}
+
+// Outlier calibration
+static float tq3_channel_accum[TQ_MAX_LAYERS][128];
+static int   tq3_calib_count[TQ_MAX_LAYERS];
+#define TQ_CALIB_TOKENS 32
+
+static void tq3_calibrate_outliers(int layer, const float * x, int64_t k) {
+    if (layer < 0 || layer >= TQ_MAX_LAYERS) return;
+    if (tq3_layers[layer].calibrated) return;
+    int nb = k / 128;
+    for (int b = 0; b < nb; b++) {
+        const float * xi = x + b * 128;
+        for (int j = 0; j < 128; j++) tq3_channel_accum[layer][j] += fabsf(xi[j]);
+        tq3_calib_count[layer]++;
+        if (tq3_calib_count[layer] >= TQ_CALIB_TOKENS) {
+            uint8_t order[128];
+            for (int j = 0; j < 128; j++) order[j] = (uint8_t)j;
+            for (int i = 1; i < 128; i++) {
+                uint8_t key = order[i];
+                float key_val = tq3_channel_accum[layer][key];
+                int j = i - 1;
+                while (j >= 0 && tq3_channel_accum[layer][order[j]] < key_val) {
+                    order[j+1] = order[j]; j--;
+                }
+                order[j+1] = key;
+            }
+            for (int j = 0; j < TQ_N_OUTLIER; j++) tq3_layers[layer].outlier_ch[j] = order[j];
+            tq3_layers[layer].calibrated = true;
         }
     }
-    // Rows are orthonormal (unit length). The qjl_scale factor accounts for this.
-    tq3_inited_128 = 1;
 }
 
-static void tq3_ensure_init_256(void) {
-    if (tq3_inited_256) return;
-    uint64_t sign_seed = 42;
-    for (int j = 0; j < QK_TQ3_256; j++) {
-        sign_seed ^= sign_seed << 13; sign_seed ^= sign_seed >> 7; sign_seed ^= sign_seed << 17;
-        tq3_signs_256[j] = (sign_seed & 1) ? 1.0f : -1.0f;
-    }
-    tq3_rng_seed(1042);
-    for (int i = 0; i < QK_TQ3_256; i++)
-        for (int j = 0; j < QK_TQ3_256; j++)
-            tq3_S_256[i][j] = (float)tq3_gaussian();
-    tq3_inited_256 = 1;
-}
-
-// FWHT and rotation helpers (parameterized by d)
-static void tq3_fwht(float *x, int d) {
-    for (int h = 1; h < d; h *= 2)
-        for (int i = 0; i < d; i += h*2)
-            for (int j = i; j < i+h; j++) {
-                float a = x[j], b = x[j+h];
-                x[j] = a+b; x[j+h] = a-b;
-            }
-    float s = 1.0f / sqrtf((float)d);
-    for (int j = 0; j < d; j++) x[j] *= s;
-}
-
-static void tq3_rotate(float *out, const float *x, const float *signs, int d) {
-    for (int j = 0; j < d; j++) out[j] = signs[j] * x[j];
-    tq3_fwht(out, d);
-}
-
-static void tq3_unrotate(float *out, const float *y, const float *signs, int d) {
-    for (int j = 0; j < d; j++) out[j] = y[j];
-    tq3_fwht(out, d);
-    for (int j = 0; j < d; j++) out[j] *= signs[j];
-}
-
-// Instantiate TQ3 for 128-element blocks
-#define TQ3_N        QK_TQ3_128
-#define TQ3_SUFFIX   _128
-#define TQ3_SUFFIX_R _128_ref
-#define TQ3_SIGNS    tq3_signs_128
-#define TQ3_S        tq3_S_128
-#define TQ3_INIT     tq3_ensure_init_128
-#define TQ3_BLOCK    block_tq3_128
-#define TQ3_QBLOCK   block_tq3_q_128
+// --- TQ3 (b=3, 2.5-bit) ---
+#define TQ_NAME         tq3_128
+#define TQ_BLOCK        block_tq3_128
+#define TQ_Q_BLOCK      block_tq3_q_128
+#define TQ_N            128
+#define TQ_OUT_BITS     3
+#define TQ_REG_BITS     1
+#define TQ_OUT_CB       tq3_cb_out
+#define TQ_OUT_BD       tq3_bd_out
+#define TQ_OUT_NCLUSTERS 8
+#define TQ_REG_CB       tq3_cb_reg
+#define TQ_REG_BD       tq3_bd_reg
+#define TQ_REG_NCLUSTERS 2
 #include "tq3_impl.inc"
-#undef TQ3_N
-#undef TQ3_SUFFIX
-#undef TQ3_SUFFIX_R
-#undef TQ3_SIGNS
-#undef TQ3_S
-#undef TQ3_INIT
-#undef TQ3_BLOCK
-#undef TQ3_QBLOCK
 
-// Instantiate TQ3 for 256-element blocks
-#define TQ3_N        QK_TQ3_256
-#define TQ3_SUFFIX   _256
-#define TQ3_SUFFIX_R _256_ref
-#define TQ3_SIGNS    tq3_signs_256
-#define TQ3_S        tq3_S_256
-#define TQ3_INIT     tq3_ensure_init_256
-#define TQ3_BLOCK    block_tq3_256
-#define TQ3_QBLOCK   block_tq3_q_256
+// --- TQ4 (b=4, 3.5-bit) ---
+#define TQ_NAME         tq4_128
+#define TQ_BLOCK        block_tq4_128
+#define TQ_Q_BLOCK      block_tq3_q_128
+#define TQ_N            128
+#define TQ_OUT_BITS     4
+#define TQ_REG_BITS     2
+#define TQ_OUT_CB       tq4_cb_out
+#define TQ_OUT_BD       tq4_bd_out
+#define TQ_OUT_NCLUSTERS 16
+#define TQ_REG_CB       tq4_cb_reg
+#define TQ_REG_BD       tq4_bd_reg
+#define TQ_REG_NCLUSTERS 4
 #include "tq3_impl.inc"
-#undef TQ3_N
-#undef TQ3_SUFFIX
-#undef TQ3_SUFFIX_R
-#undef TQ3_SIGNS
-#undef TQ3_S
-#undef TQ3_INIT
-#undef TQ3_BLOCK
-#undef TQ3_QBLOCK
 
 // ====================== "True" 2-bit (de)-quantization
 
