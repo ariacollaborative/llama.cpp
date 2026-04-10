@@ -278,7 +278,6 @@ llama_kv_cache::llama_kv_cache(
         !attn_rot_disable &&
         ggml_is_quantized(type_k) &&
         type_k != GGML_TYPE_TQ3_128 &&
-        type_k != GGML_TYPE_TQ3_256 &&
         !hparams.is_n_embd_k_gqa_variable() &&
         hparams.n_embd_head_k() % 64 == 0;
 
