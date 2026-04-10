@@ -11701,6 +11701,38 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 #endif
             break;
         }
+        case GGML_TYPE_TQ3_128:
+        case GGML_TYPE_TQ3_256: {
+            kernel = (src0t == GGML_TYPE_TQ3_128)
+                ? backend_ctx->kernel_mul_mv_tq3_128_f32
+                : backend_ctx->kernel_mul_mv_tq3_256_f32;
+            CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
+            CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
+            CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra1->data_device));
+            CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
+            CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extrad->data_device));
+            CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offsetd));
+            CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &ne00));
+            CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &ne01));
+            CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne02));
+            CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &ne10));
+            CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &ne12));
+            CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &ne0));
+            CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &ne1));
+            CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &r2));
+            CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &r3));
+            if (src0t == GGML_TYPE_TQ3_128) {
+                CL_CHECK(clSetKernelArg(kernel, 15, sizeof(cl_mem), &backend_ctx->tq3_signs_128));
+                CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_mem), &backend_ctx->tq3_s_transpose_128));
+            } else {
+                CL_CHECK(clSetKernelArg(kernel, 15, sizeof(cl_mem), &backend_ctx->tq3_signs_256));
+                CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_mem), &backend_ctx->tq3_s_transpose_256));
+            }
+            size_t global_work_size[] = {(size_t)ne01, (size_t)ne12*ne13, 1};
+            size_t local_work_size[] = {1, 1, 1};
+            backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+            return;
+        }
         default:
             GGML_ASSERT(false && "not implemented");
     }
