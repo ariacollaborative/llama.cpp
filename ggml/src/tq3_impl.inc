@@ -117,8 +117,11 @@ static void tq_resolve_layer(int layer, int n_out,
         if (tq3_layers[layer].calibrated) {
             tq_build_outlier_mask(tq3_layers[layer].outlier_ch, is_out, n_out);
         } else {
+            // Default outlier mask: last N channels (127,126,...) which are
+            // typically massive-activation channels in transformer models.
+            // Proper calibration overwrites this after first block.
             memset(is_out, 0, 128);
-            for (int c = 0; c < n_out; c++) is_out[c] = 1;
+            for (int c = 0; c < n_out; c++) is_out[128 - 1 - c] = 1;
         }
         if (tq3_layers[layer].matrices_initialized) {
             if (n_out == 32) {
