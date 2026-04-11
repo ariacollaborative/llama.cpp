@@ -2336,57 +2336,23 @@ void dequantize_row_tq2_0(const block_tq2_0 * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
-// ====================== TQ3/TQ4: KV cache quantization =====================
+// ====================== TQ3: KV cache quantization (uniform d=128) ==========
 
 // Thread-local layer context
 static _Thread_local int tq3_current_layer = -1;
 void tq3_set_layer(int layer) { tq3_current_layer = layer; }
 int  tq3_get_layer(void)      { return tq3_current_layer; }
 
-// Per-layer state
-// Stores separate rotation matrices for each (n_out, n_reg) combination used:
-//   TQ3: n_out=32, n_reg=96  → Pi_out_small, Pi_reg_large
-//   TQ4: n_out=64, n_reg=64  → Pi_out_large, Pi_reg_small
+// Per-layer state: one 128×128 rotation matrix Pi and one 128×128 Gaussian S
 static struct {
-    uint8_t outlier_ch[64];             // top-64 outlier channels (TQ3 uses first 32)
-    bool calibrated;
-    float Pi_out_small[32][32];         // 32×32 rotation for TQ3 outlier group
-    float Pi_out_large[64][64];         // 64×64 rotation for TQ4 outlier group
-    float Pi_reg_large[96][96];         // 96×96 rotation for TQ3 regular group
-    float Pi_reg_small[64][64];         // 64×64 rotation for TQ4 regular group
-    float S[128][128];                  // UNIFIED QJL projection
-    bool matrices_initialized;
+    float Pi[128][128];
+    float S[128][128];
+    bool initialized;
 } tq3_layers[TQ_MAX_LAYERS];
 
-// TQ3 outlier: d=32, b=3 (8 centroids)
-static const float tq3_cb_out[8] = {
-    -0.3662682415f, -0.2324605662f, -0.1317560962f, -0.0428515154f,
-     0.0428515154f,  0.1317560962f,  0.2324605662f,  0.3662682415f
-};
-static const float tq3_bd_out[7] = {
-    -0.2993644038f, -0.1821083312f, -0.0873038058f, 0.0f,
-     0.0873038058f,  0.1821083312f,  0.2993644038f
-};
-
-// TQ3 regular: d=96, b=1 (2 centroids)
-static const float tq3_cb_reg[2] = { -0.0816460916f, 0.0816460916f };
-static const float tq3_bd_reg[1] = { 0.0f };
-
-// TQ4 outlier: d=64, b=3 (8 centroids)
-static const float tq4_cb_out[8] = {
-    -0.2639074472f, -0.1661610405f, -0.0938271833f, -0.0304673059f,
-     0.0304673059f,  0.0938271833f,  0.1661610405f,  0.2639074472f
-};
-static const float tq4_bd_out[7] = {
-    -0.2150342439f, -0.1299941119f, -0.0621472446f, 0.0f,
-     0.0621472446f,  0.1299941119f,  0.2150342439f
-};
-
-// TQ4 regular: d=64, b=2 (4 centroids)
-static const float tq4_cb_reg[4] = {
-    -0.1874958479f, -0.0565143689f, 0.0565143689f, 0.1874958479f
-};
-static const float tq4_bd_reg[3] = { -0.1220051084f, 0.0f, 0.1220051084f };
+// Uniform 2-bit codebook for d=128 (4 centroids)
+static const float tq3_codebook[4]   = { -0.13304020f, -0.03999094f, 0.03999094f, 0.13304020f };
+static const float tq3_boundaries[3] = { -0.08651557f, 0.0f, 0.08651557f };
 
 // RNG
 static uint64_t tq3_rng_state;
@@ -2436,131 +2402,14 @@ static void tq3_generate_s_matrix(float * S, int d, uint64_t seed) {
 
 static void tq3_ensure_layer_matrices(int layer) {
     if (layer < 0 || layer >= TQ_MAX_LAYERS) return;
-    if (tq3_layers[layer].matrices_initialized) return;
+    if (tq3_layers[layer].initialized) return;
     uint64_t rot_seed = 42 + (uint64_t)layer * 7;
     uint64_t s_seed   = 1042 + (uint64_t)layer * 7;
-    // Generate all four rotation matrices so both TQ3 and TQ4 get proper orthogonal matrices.
-    tq3_generate_rotation(&tq3_layers[layer].Pi_out_small[0][0], 32, rot_seed);
-    tq3_generate_rotation(&tq3_layers[layer].Pi_out_large[0][0], 64, rot_seed + 200);
-    tq3_generate_rotation(&tq3_layers[layer].Pi_reg_large[0][0], 96, rot_seed + 1);
-    tq3_generate_rotation(&tq3_layers[layer].Pi_reg_small[0][0], 64, rot_seed + 201);
+    tq3_generate_rotation(&tq3_layers[layer].Pi[0][0], 128, rot_seed);
     tq3_generate_s_matrix(&tq3_layers[layer].S[0][0], 128, s_seed);
-    tq3_layers[layer].matrices_initialized = true;
+    tq3_layers[layer].initialized = true;
 }
 
-// Outlier calibration
-static float tq3_channel_accum[TQ_MAX_LAYERS][128];
-static int   tq3_calib_count[TQ_MAX_LAYERS];
-#define TQ_CALIB_TOKENS 1
-
-static void tq3_calibrate_outliers(int layer, const float * x, int64_t k) {
-    if (layer < 0 || layer >= TQ_MAX_LAYERS) return;
-    if (__atomic_load_n(&tq3_layers[layer].calibrated, __ATOMIC_ACQUIRE)) return;
-    int nb = k / 128;
-    for (int b = 0; b < nb; b++) {
-        const float * xi = x + b * 128;
-        for (int j = 0; j < 128; j++) tq3_channel_accum[layer][j] += fabsf(xi[j]);
-        tq3_calib_count[layer]++;
-    }
-    if (tq3_calib_count[layer] >= TQ_CALIB_TOKENS) {
-        uint8_t order[128];
-        for (int j = 0; j < 128; j++) order[j] = (uint8_t)j;
-        for (int i = 1; i < 128; i++) {
-            uint8_t key = order[i];
-            float key_val = tq3_channel_accum[layer][key];
-            int j = i - 1;
-            while (j >= 0 && tq3_channel_accum[layer][order[j]] < key_val) {
-                order[j+1] = order[j]; j--;
-            }
-            order[j+1] = key;
-        }
-        for (int j = 0; j < 64; j++) tq3_layers[layer].outlier_ch[j] = order[j];
-        __atomic_store_n(&tq3_layers[layer].calibrated, true, __ATOMIC_RELEASE);
-    }
-}
-
-// Weight-based outlier detection: analyze W_K column norms.
-// Call once per layer during model loading — before any inference.
-// wk is dequantized as [n_output_dims, n_input_dims] row-major.
-// Each row j (j=0..n_output_dims-1) is one output column of the weight matrix.
-// n_output_dims = n_head_kv * head_dim.  We compute per-head-dim row norms.
-void tq3_init_outliers_from_weights(int layer, const float * wk, int n_output_dims, int n_input_dims, int n_head_kv) {
-    if (layer < 0 || layer >= TQ_MAX_LAYERS) return;
-    if (tq3_layers[layer].calibrated) return;
-    int head_dim = n_output_dims / n_head_kv;
-    if (head_dim != 128) return;
-
-    // Compute L2 norm of each row (= each output column of W_K)
-    float row_norms[256];
-    for (int j = 0; j < n_output_dims; j++) {
-        float norm2 = 0.0f;
-        for (int i = 0; i < n_input_dims; i++) {
-            float v = wk[j * n_input_dims + i];
-            norm2 += v * v;
-        }
-        row_norms[j] = sqrtf(norm2);
-    }
-
-    // Average norms across KV heads for each head dimension
-    float dim_norms[128] = {0};
-    for (int h = 0; h < n_head_kv; h++)
-        for (int d = 0; d < 128; d++)
-            dim_norms[d] += row_norms[h * 128 + d];
-    for (int d = 0; d < 128; d++) dim_norms[d] /= n_head_kv;
-
-    // Sort by norm descending, top 32 = outliers
-    uint8_t order[128];
-    for (int j = 0; j < 128; j++) order[j] = (uint8_t)j;
-    for (int i = 1; i < 128; i++) {
-        uint8_t key = order[i];
-        float key_val = dim_norms[key];
-        int j = i - 1;
-        while (j >= 0 && dim_norms[order[j]] < key_val) {
-            order[j + 1] = order[j]; j--;
-        }
-        order[j + 1] = key;
-    }
-    // Store top-64 outliers: TQ3 uses first 32, TQ4 uses all 64.
-    for (int j = 0; j < 64; j++)
-        tq3_layers[layer].outlier_ch[j] = order[j];
-    tq3_layers[layer].calibrated = true;
-    fprintf(stderr, "TQ3_WEIGHT layer=%d outliers=[%d,%d,%d,%d,...] max=%.2f min=%.2f ratio=%.1f\n",
-        layer, order[0], order[1], order[2], order[3],
-        dim_norms[order[0]], dim_norms[order[127]], dim_norms[order[0]]/dim_norms[order[127]]);
-}
-
-// --- TQ3 (b=3, 2.5-bit, 32/96 split) ---
-#define TQ_NAME         tq3_128
-#define TQ_BLOCK        block_tq3_128
-#define TQ_Q_BLOCK      block_tq3_q_128
-#define TQ_N            128
-#define TQ_N_OUT        32
-#define TQ_N_REG        96
-#define TQ_OUT_BITS     3
-#define TQ_REG_BITS     1
-#define TQ_OUT_CB       tq3_cb_out
-#define TQ_OUT_BD       tq3_bd_out
-#define TQ_OUT_NCLUSTERS 8
-#define TQ_REG_CB       tq3_cb_reg
-#define TQ_REG_BD       tq3_bd_reg
-#define TQ_REG_NCLUSTERS 2
-#include "tq3_impl.inc"
-
-// --- TQ4 (b=4, 3.5-bit, 64/64 split) ---
-#define TQ_NAME         tq4_128
-#define TQ_BLOCK        block_tq4_128
-#define TQ_Q_BLOCK      block_tq3_q_128
-#define TQ_N            128
-#define TQ_N_OUT        64
-#define TQ_N_REG        64
-#define TQ_OUT_BITS     3
-#define TQ_REG_BITS     2
-#define TQ_OUT_CB       tq4_cb_out
-#define TQ_OUT_BD       tq4_bd_out
-#define TQ_OUT_NCLUSTERS 8
-#define TQ_REG_CB       tq4_cb_reg
-#define TQ_REG_BD       tq4_bd_reg
-#define TQ_REG_NCLUSTERS 4
 #include "tq3_impl.inc"
 
 // ====================== "True" 2-bit (de)-quantization

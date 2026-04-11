@@ -4931,8 +4931,8 @@ static void ggml_compute_forward_set_rows_f32(
     const int64_t ir0 = dr*ith;
     const int64_t ir1 = std::min(ir0 + dr, nr);
 
-    // Set TQ3/TQ4 layer context for per-layer outlier detection
-    if (dst->type == GGML_TYPE_TQ3_128 || dst->type == GGML_TYPE_TQ4_128) {
+    // Set TQ3 layer context for quantization
+    if (dst->type == GGML_TYPE_TQ3_128) {
         int layer = -1;
         const char * p = strstr(dst->name, "_l");
         if (p) {
@@ -8256,8 +8256,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     ggml_vec_dot_t    const kq_vec_dot     = ggml_get_type_traits_cpu(k->type)->vec_dot;
     ggml_to_float_t   const v_to_float     = ggml_get_type_traits(v->type)->to_float;
 
-    // Set TQ3/TQ4 layer context for flash attention path
-    if (k->type == GGML_TYPE_TQ3_128 || k->type == GGML_TYPE_TQ4_128) {
+    // Set TQ3 layer context for flash attention path
+    if (k->type == GGML_TYPE_TQ3_128) {
         int layer = -1;
         const char * p = strstr(k->name, "_l");
         if (p) layer = atoi(p + 2);

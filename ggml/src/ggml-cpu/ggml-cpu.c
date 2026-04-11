@@ -397,17 +397,8 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .nrows        = 1,
         .from_float   = (ggml_from_float_t) quantize_row_tq3_128_ref,
     },
-    [GGML_TYPE_TQ4_128] = {
-        .vec_dot      = ggml_vec_dot_tq4_q_128,
-        .vec_dot_type = GGML_TYPE_TQ4_Q_128,
-        .nrows        = 1,
-        .from_float   = (ggml_from_float_t) quantize_row_tq4_128_ref,
-    },
     [GGML_TYPE_TQ3_Q_128] = {
         .from_float   = (ggml_from_float_t) from_float_tq3_q_128,
-    },
-    [GGML_TYPE_TQ4_Q_128] = {
-        .from_float   = (ggml_from_float_t) from_float_tq4_q_128,
     },
     [GGML_TYPE_I32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
