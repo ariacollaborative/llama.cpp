@@ -110,6 +110,8 @@ static void tq_resolve_layer(int layer, int n_out,
                              const float ** Pi_out, const float ** Pi_reg,
                              const float ** S) {
     uint8_t is_out[128];
+    // DIAGNOSTIC: if layer is -1 (not set), force to 0
+    if (layer < 0) layer = 0;
     if (layer >= 0 && layer < TQ_MAX_LAYERS) {
         tq3_ensure_layer_matrices(layer);
         if (tq3_layers[layer].calibrated) {
@@ -485,6 +487,7 @@ void from_float_tq3_q_128(const float * GGML_RESTRICT x,
 #else
 void from_float_tq4_q_128(const float * GGML_RESTRICT x,
                            block_tq3_q_128 * GGML_RESTRICT y, int64_t k) {
+    static int _c; if(!_c++){fprintf(stderr,"TQ4_FF called k=%lld layer=%d\n",(long long)k,tq3_get_layer());}
     from_float_impl_tq4_128(x, y, k);
 }
 #endif

@@ -31,7 +31,7 @@ int main(void) {
     
     // Preprocess query
     block_tq3_q_128 qblock;
-    from_float_tq3_q_128(query, &qblock, N);
+    from_float_tq4_q_128(query, &qblock, N);
     
     printf("%-4s  %12s  %12s  %12s  %8s\n", "Key", "f32_dot", "deq_dot", "vecdot", "vd_err%");
     
