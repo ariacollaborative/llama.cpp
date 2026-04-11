@@ -1,5 +1,9 @@
 #include "llama-context.h"
 
+extern "C" {
+    void tq3_init_outliers_from_weights(int layer, const float * wk, int n_out, int n_in, int n_head_kv);
+}
+
 #include "llama-arch.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
@@ -2974,6 +2978,32 @@ llama_context * llama_init_from_model(
         //user-specified pooling-type is different from the model default
         LLAMA_LOG_WARN("%s: model default pooling_type is [%d], but [%d] was specified\n", __func__,
                        model->hparams.pooling_type, params.pooling_type);
+    }
+
+    // TQ3/TQ4: detect outlier channels from W_K weights BEFORE repacking
+    if (params.type_k == GGML_TYPE_TQ3_128 || params.type_k == GGML_TYPE_TQ4_128) {
+        const int n_layer = model->hparams.n_layer;
+        const int n_head_kv = model->hparams.n_head_kv();
+        for (int il = 0; il < n_layer; il++) {
+            const ggml_tensor * wk = model->layers[il].wk;
+            if (!wk || !wk->data) continue;
+            const int64_t n_row = wk->ne[1];
+            const int64_t n_col = wk->ne[0];
+            std::vector<float> wk_f32(n_row * n_col);
+            auto to_float = ggml_get_type_traits(wk->type)->to_float;
+            if (to_float) {
+                int64_t row_bytes = ggml_row_size(wk->type, n_col);
+                for (int64_t r = 0; r < n_row; r++)
+                    to_float((const char *)wk->data + r * row_bytes, wk_f32.data() + r * n_col, n_col);
+            } else {
+                memcpy(wk_f32.data(), wk->data, n_row * n_col * sizeof(float));
+            }
+            if (il == 0) {
+                LLAMA_LOG_INFO("TQ3_WB row0[0..4]=%.4f,%.4f,%.4f,%.4f,%.4f row0[100]=%.4f row0[2000]=%.4f\n",
+                    wk_f32[0],wk_f32[1],wk_f32[2],wk_f32[3],wk_f32[4],wk_f32[100],wk_f32[2000]);
+            }
+            tq3_init_outliers_from_weights(il, wk_f32.data(), (int)n_row, (int)n_col, n_head_kv);
+        }
     }
 
     try {
