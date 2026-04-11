@@ -2455,7 +2455,7 @@ static int   tq3_calib_count[TQ_MAX_LAYERS];
 
 static void tq3_calibrate_outliers(int layer, const float * x, int64_t k) {
     if (layer < 0 || layer >= TQ_MAX_LAYERS) return;
-    if (*(volatile bool *)&tq3_layers[layer].calibrated) return;
+    if (__atomic_load_n(&tq3_layers[layer].calibrated, __ATOMIC_ACQUIRE)) return;
     int nb = k / 128;
     for (int b = 0; b < nb; b++) {
         const float * xi = x + b * 128;
@@ -2475,8 +2475,7 @@ static void tq3_calibrate_outliers(int layer, const float * x, int64_t k) {
             order[j+1] = key;
         }
         for (int j = 0; j < 64; j++) tq3_layers[layer].outlier_ch[j] = order[j];
-        __sync_synchronize();
-        tq3_layers[layer].calibrated = true;
+        __atomic_store_n(&tq3_layers[layer].calibrated, true, __ATOMIC_RELEASE);
     }
 }
 

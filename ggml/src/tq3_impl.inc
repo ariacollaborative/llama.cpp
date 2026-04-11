@@ -114,7 +114,7 @@ static void tq_resolve_layer(int layer, int n_out,
     if (layer < 0) layer = 0;
     if (layer >= 0 && layer < TQ_MAX_LAYERS) {
         tq3_ensure_layer_matrices(layer);
-        if (tq3_layers[layer].calibrated) {
+        if (__atomic_load_n(&tq3_layers[layer].calibrated, __ATOMIC_ACQUIRE)) {
             tq_build_outlier_mask(tq3_layers[layer].outlier_ch, is_out, n_out);
         } else {
             // Default outlier mask: last N channels (127,126,...) which are
