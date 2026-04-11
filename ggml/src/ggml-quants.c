@@ -2500,12 +2500,13 @@ void tq3_init_outliers_from_weights(int layer, const float * wk, int n_output_di
     int head_dim = n_output_dims / n_head_kv;
     if (head_dim != 128) return;
 
-    // Compute L2 norm of each row (= each output column of W_K)
+    // Compute L2 norm of each row, filtering NaN/Inf from dequant
     float row_norms[256];
     for (int j = 0; j < n_output_dims; j++) {
         float norm2 = 0.0f;
         for (int i = 0; i < n_input_dims; i++) {
             float v = wk[j * n_input_dims + i];
+            if (v != v || v > 1e30f || v < -1e30f) continue; // skip NaN/Inf
             norm2 += v * v;
         }
         row_norms[j] = sqrtf(norm2);

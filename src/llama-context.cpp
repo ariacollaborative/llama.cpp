@@ -2981,7 +2981,9 @@ llama_context * llama_init_from_model(
     }
 
     // TQ3/TQ4: detect outlier channels from W_K weights BEFORE repacking
-    if (params.type_k == GGML_TYPE_TQ3_128 || params.type_k == GGML_TYPE_TQ4_128) {
+    // DISABLED: weight norms don't predict activation outliers.
+    // Runtime calibration from actual activations is more accurate.
+    if (false && (params.type_k == GGML_TYPE_TQ3_128 || params.type_k == GGML_TYPE_TQ4_128)) {
         const int n_layer = model->hparams.n_layer;
         const int n_head_kv = model->hparams.n_head_kv();
         for (int il = 0; il < n_layer; il++) {
