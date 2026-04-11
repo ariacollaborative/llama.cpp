@@ -430,8 +430,9 @@ extern "C" {
         GGML_TYPE_NVFP4     = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_TQ3_128   = 41, // TurboQuant b=3, 2.5-bit mixed precision
         GGML_TYPE_TQ4_128   = 42, // TurboQuant b=4, 3.5-bit mixed precision
-        GGML_TYPE_TQ3_Q_128 = 43, // TurboQuant query preprocessing block
-        GGML_TYPE_COUNT     = 44,
+        GGML_TYPE_TQ3_Q_128 = 43, // TurboQuant query block (32/96 split)
+        GGML_TYPE_TQ4_Q_128 = 44, // TurboQuant query block (64/64 split)
+        GGML_TYPE_COUNT     = 45,
     };
 
     // precision

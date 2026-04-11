@@ -928,6 +928,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float      = NULL,
         .from_float_ref = (ggml_from_float_t) from_float_tq3_q_128,
     },
+    [GGML_TYPE_TQ4_Q_128] = {
+        .type_name     = "tq4_q_128",
+        .blck_size     = 128,
+        .type_size     = sizeof(block_tq3_q_128),
+        .is_quantized  = true,
+        .to_float      = NULL,
+        .from_float_ref = (ggml_from_float_t) from_float_tq4_q_128,
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
