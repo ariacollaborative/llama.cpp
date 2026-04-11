@@ -2454,31 +2454,29 @@ static int   tq3_calib_count[TQ_MAX_LAYERS];
 #define TQ_CALIB_TOKENS 1
 
 static void tq3_calibrate_outliers(int layer, const float * x, int64_t k) {
-    (void)layer; (void)x; (void)k;
     if (layer < 0 || layer >= TQ_MAX_LAYERS) return;
-    if (tq3_layers[layer].calibrated) return;
+    if (*(volatile bool *)&tq3_layers[layer].calibrated) return;
     int nb = k / 128;
     for (int b = 0; b < nb; b++) {
         const float * xi = x + b * 128;
         for (int j = 0; j < 128; j++) tq3_channel_accum[layer][j] += fabsf(xi[j]);
         tq3_calib_count[layer]++;
-        if (tq3_calib_count[layer] >= TQ_CALIB_TOKENS) {
-            uint8_t order[128];
-            for (int j = 0; j < 128; j++) order[j] = (uint8_t)j;
-            for (int i = 1; i < 128; i++) {
-                uint8_t key = order[i];
-                float key_val = tq3_channel_accum[layer][key];
-                int j = i - 1;
-                while (j >= 0 && tq3_channel_accum[layer][order[j]] < key_val) {
-                    order[j+1] = order[j]; j--;
-                }
-                order[j+1] = key;
+    }
+    if (tq3_calib_count[layer] >= TQ_CALIB_TOKENS) {
+        uint8_t order[128];
+        for (int j = 0; j < 128; j++) order[j] = (uint8_t)j;
+        for (int i = 1; i < 128; i++) {
+            uint8_t key = order[i];
+            float key_val = tq3_channel_accum[layer][key];
+            int j = i - 1;
+            while (j >= 0 && tq3_channel_accum[layer][order[j]] < key_val) {
+                order[j+1] = order[j]; j--;
             }
-            // Store top-64 outliers: TQ3 uses first 32, TQ4 uses all 64.
-            for (int j = 0; j < 64; j++) tq3_layers[layer].outlier_ch[j] = order[j];
-            tq3_layers[layer].calibrated = true;
-            fprintf(stderr, "TQ3_CALIB layer=%d outliers=[%d,%d,%d,%d,...] count=%d\n", layer, tq3_layers[layer].outlier_ch[0], tq3_layers[layer].outlier_ch[1], tq3_layers[layer].outlier_ch[2], tq3_layers[layer].outlier_ch[3], tq3_calib_count[layer]);
+            order[j+1] = key;
         }
+        for (int j = 0; j < 64; j++) tq3_layers[layer].outlier_ch[j] = order[j];
+        __sync_synchronize();
+        tq3_layers[layer].calibrated = true;
     }
 }
 

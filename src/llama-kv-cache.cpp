@@ -294,8 +294,9 @@ llama_kv_cache::llama_kv_cache(
     LLAMA_LOG_INFO("%s: attn_rot_k = %d\n", __func__, attn_rot_k);
     LLAMA_LOG_INFO("%s: attn_rot_v = %d\n", __func__, attn_rot_v);
 
-    // Initialize TQ3/TQ4 outlier channels from W_K weight matrix column norms
-    if (type_k == GGML_TYPE_TQ3_128 || type_k == GGML_TYPE_TQ4_128) {
+    // DISABLED: weight-based detection reads repacked tensor data (NaN norms).
+    // Runtime calibration from first block's activations is used instead.
+    if (false && (type_k == GGML_TYPE_TQ3_128 || type_k == GGML_TYPE_TQ4_128)) {
         const int n_layer = hparams.n_layer;
         const int n_embd = hparams.n_embd;
         const int n_embd_k_gqa = hparams.n_embd_k_gqa();
