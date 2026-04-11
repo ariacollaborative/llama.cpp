@@ -2460,7 +2460,6 @@ static void tq3_calibrate_outliers(int layer, const float * x, int64_t k) {
     if (__atomic_load_n(&tq3_layers[layer].calibrated, __ATOMIC_ACQUIRE)) return;
 
     pthread_mutex_lock(&tq3_calib_mutex);
-    // Double-check after acquiring lock
     if (tq3_layers[layer].calibrated) {
         pthread_mutex_unlock(&tq3_calib_mutex);
         return;
