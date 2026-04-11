@@ -293,6 +293,43 @@ static void TQ_FN(quant_impl)(const float * GGML_RESTRICT x,
             }
 
             yi->resnorm = GGML_FP32_TO_FP16(resnorm);
+
+            // ONE-TIME DIAGNOSTIC: MSE on real model data
+            if (i == 0 && layer == 0) {
+                static int _qd;
+                if (!_qd++) {
+                    float mse = 0, energy = 0, cos_d = 0, na = 0;
+                    for (int j = 0; j < 128; j++) {
+                        float e = xi[j] - x_mse[j];
+                        mse += e*e;
+                        energy += xi[j]*xi[j];
+                        cos_d += xi[j]*x_mse[j];
+                        na += x_mse[j]*x_mse[j];
+                    }
+                    // Find actual max abs value to see if there are outliers
+                    float maxv = 0;
+                    int maxi = 0;
+                    for (int j = 0; j < 128; j++) {
+                        if (fabsf(xi[j]) > maxv) { maxv = fabsf(xi[j]); maxi = j; }
+                    }
+                    // Also test q4_0 on same data for comparison
+                    block_q4_0 q4blocks[4]; // 128/32 = 4 blocks
+                    quantize_row_q4_0_ref(xi, q4blocks, 128);
+                    float xq4[128];
+                    dequantize_row_q4_0(q4blocks, xq4, 128);
+                    float q4mse = 0, q4cos = 0, q4na = 0;
+                    for (int j = 0; j < 128; j++) {
+                        float e = xi[j] - xq4[j];
+                        q4mse += e*e;
+                        q4cos += xi[j]*xq4[j];
+                        q4na += xq4[j]*xq4[j];
+                    }
+                    fprintf(stderr, "TQ_REAL tq4: mse=%.1f%% cos=%.6f | q4_0: mse=%.1f%% cos=%.6f | norm=%.2f max=%.2f@ch%d\n",
+                        100*mse/energy, cos_d/sqrtf(energy*na),
+                        100*q4mse/energy, q4cos/sqrtf(energy*q4na),
+                        sqrtf(energy), maxv, maxi);
+                }
+            }
         }
 
         (void)out_norm; (void)reg_norm;
