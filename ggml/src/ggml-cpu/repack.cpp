@@ -4291,8 +4291,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         const ggml_from_float_t from_float = ggml_get_type_traits_cpu(PARAM_TYPE)->from_float;
 
-        // Set TQ3 layer context
-        if (src0->type == GGML_TYPE_TQ3_128) {
+        // Set TQ3/TQ4 layer context for per-layer outlier mask
+        if (src0->type == GGML_TYPE_TQ3_128 || src0->type == GGML_TYPE_TQ4_128) {
             int layer = -1;
             const char * p = strstr(src0->name, "_l");
             if (p) layer = atoi(p + 2);
