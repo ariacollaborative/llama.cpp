@@ -2448,14 +2448,24 @@ static void tq3_ensure_layer_matrices(int layer) {
     tq3_layers[layer].matrices_initialized = true;
 }
 
-// Outlier calibration
+// Outlier calibration — mutex-protected so all threads contribute before sorting
+#include <pthread.h>
 static float tq3_channel_accum[TQ_MAX_LAYERS][128];
 static int   tq3_calib_count[TQ_MAX_LAYERS];
-#define TQ_CALIB_TOKENS 1
+static pthread_mutex_t tq3_calib_mutex = PTHREAD_MUTEX_INITIALIZER;
+#define TQ_CALIB_TOKENS 4
 
 static void tq3_calibrate_outliers(int layer, const float * x, int64_t k) {
     if (layer < 0 || layer >= TQ_MAX_LAYERS) return;
     if (__atomic_load_n(&tq3_layers[layer].calibrated, __ATOMIC_ACQUIRE)) return;
+
+    pthread_mutex_lock(&tq3_calib_mutex);
+    // Double-check after acquiring lock
+    if (tq3_layers[layer].calibrated) {
+        pthread_mutex_unlock(&tq3_calib_mutex);
+        return;
+    }
+
     int nb = k / 128;
     for (int b = 0; b < nb; b++) {
         const float * xi = x + b * 128;
@@ -2477,6 +2487,7 @@ static void tq3_calibrate_outliers(int layer, const float * x, int64_t k) {
         for (int j = 0; j < 64; j++) tq3_layers[layer].outlier_ch[j] = order[j];
         __atomic_store_n(&tq3_layers[layer].calibrated, true, __ATOMIC_RELEASE);
     }
+    pthread_mutex_unlock(&tq3_calib_mutex);
 }
 
 // Weight-based outlier detection: analyze W_K column norms.

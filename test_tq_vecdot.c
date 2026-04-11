@@ -25,13 +25,13 @@ int main(void) {
     }
     
     // Quantize keys
-    block_tq4_128 blocks[10];
+    block_tq3_128 blocks[10];
     for (int i = 0; i < NKEYS; i++)
-        quantize_row_tq4_128_ref(keys[i], &blocks[i], N);
+        quantize_row_tq3_128_ref(keys[i], &blocks[i], N);
     
     // Preprocess query
     block_tq3_q_128 qblock;
-    from_float_tq4_q_128(query, &qblock, N);
+    from_float_tq3_q_128(query, &qblock, N);
     
     printf("%-4s  %12s  %12s  %12s  %8s\n", "Key", "f32_dot", "deq_dot", "vecdot", "vd_err%");
     
@@ -42,13 +42,13 @@ int main(void) {
         
         // Dequantize path
         float kdeq[128];
-        dequantize_row_tq4_128(&blocks[i], kdeq, N);
+        dequantize_row_tq3_128(&blocks[i], kdeq, N);
         float deq = 0;
         for (int j = 0; j < N; j++) deq += kdeq[j] * query[j];
         
         // Vec_dot path
         float vd = 0;
-        ggml_vec_dot_tq4_q_128(N, &vd, 0, &blocks[i], 0, &qblock, 0, 1);
+        ggml_vec_dot_tq3_q_128(N, &vd, 0, &blocks[i], 0, &qblock, 0, 1);
         
         float err = (ref != 0) ? fabsf(vd - ref) / fabsf(ref) * 100 : 0;
         printf("%-4d  %12.4f  %12.4f  %12.4f  %7.1f%%\n", i, ref, deq, vd, err);
