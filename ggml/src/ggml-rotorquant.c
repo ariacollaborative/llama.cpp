@@ -37,29 +37,32 @@ void cl3_geometric_product(const float a[8], const float b[8], float r[8]) {
     const float b0 = b[0], b1 = b[1], b2 = b[2], b3 = b[3];
     const float b12 = b[4], b13 = b[5], b23 = b[6], b123 = b[7];
 
-    /* grade 0 (scalar) */
+    /* Derived from Cl(3,0) axioms: e_i*e_i=+1, e_i*e_j=-e_j*e_i
+     * Verified by tests/derive_cl3_table.c — 18 sign corrections from reference */
+
+    /* grade 0 (scalar) — was correct */
     r[0] = a0*b0 + a1*b1 + a2*b2 + a3*b3
          - a12*b12 - a13*b13 - a23*b23 - a123*b123;
 
-    /* grade 1 (vector) */
+    /* grade 1 (vector) — fixed: a23*b123, a123*b23, a13*b123, a123*b13, a12*b123, a123*b12 */
     r[1] = a0*b1 + a1*b0 - a2*b12 + a12*b2 - a3*b13 + a13*b3
-         + a23*b123 + a123*b23;
+         - a23*b123 - a123*b23;
     r[2] = a0*b2 + a2*b0 + a1*b12 - a12*b1 - a3*b23 + a23*b3
-         - a13*b123 - a123*b13;
+         + a13*b123 + a123*b13;
     r[3] = a0*b3 + a3*b0 + a1*b13 - a13*b1 + a2*b23 - a23*b2
-         + a12*b123 + a123*b12;
+         - a12*b123 - a123*b12;
 
-    /* grade 2 (bivector) */
-    r[4] = a0*b12 + a12*b0 + a1*b2 - a2*b1 + a13*b23 - a23*b13
-         + a3*b123 - a123*b3;
-    r[5] = a0*b13 + a13*b0 + a1*b3 - a3*b1 - a12*b23 + a23*b12
-         - a2*b123 + a123*b2;
-    r[6] = a0*b23 + a23*b0 + a2*b3 - a3*b2 + a12*b13 - a13*b12
-         + a1*b123 - a123*b1;
+    /* grade 2 (bivector) — fixed: a13*b23/a23*b13, a3*b123/a123*b3, etc */
+    r[4] = a0*b12 + a12*b0 + a1*b2 - a2*b1 - a13*b23 + a23*b13
+         + a3*b123 + a123*b3;
+    r[5] = a0*b13 + a13*b0 + a1*b3 - a3*b1 + a12*b23 - a23*b12
+         - a2*b123 - a123*b2;
+    r[6] = a0*b23 + a23*b0 + a2*b3 - a3*b2 - a12*b13 + a13*b12
+         + a1*b123 + a123*b1;
 
-    /* grade 3 (pseudoscalar) */
-    r[7] = a0*b123 + a123*b0 + a1*b23 - a23*b1 - a2*b13 + a13*b2
-         + a3*b12 - a12*b3;
+    /* grade 3 (pseudoscalar) — fixed: a23*b1, a13*b2, a12*b3 */
+    r[7] = a0*b123 + a123*b0 + a1*b23 + a23*b1 - a2*b13 - a13*b2
+         + a3*b12 + a12*b3;
 }
 
 /* ── Clifford reverse ───────────────────────────────────────────────
