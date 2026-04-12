@@ -31,7 +31,7 @@
  *
  * 64 multiplies, 56 adds = 64 FMAs.
  */
-static void cl3_geometric_product(const float a[8], const float b[8], float r[8]) {
+void cl3_geometric_product(const float a[8], const float b[8], float r[8]) {
     const float a0 = a[0], a1 = a[1], a2 = a[2], a3 = a[3];
     const float a12 = a[4], a13 = a[5], a23 = a[6], a123 = a[7];
     const float b0 = b[0], b1 = b[1], b2 = b[2], b3 = b[3];
@@ -67,7 +67,7 @@ static void cl3_geometric_product(const float a[8], const float b[8], float r[8]
  * Reverse x̃: grades 0,1 unchanged, grades 2,3 negated.
  * For rotor R, R̃ is used in the sandwich product R·v·R̃.
  */
-static void cl3_reverse(const float x[8], float r[8]) {
+void cl3_reverse(const float x[8], float r[8]) {
     r[0] =  x[0]; r[1] =  x[1]; r[2] =  x[2]; r[3] =  x[3];
     r[4] = -x[4]; r[5] = -x[5]; r[6] = -x[6]; r[7] = -x[7];
 }
@@ -159,10 +159,10 @@ static void rq_make_rotor(float rotor[8], int seed) {
 }
 
 /* ── Static rotor storage (max 86 rotors for d=256, generated once) ─*/
-static float rq_rotors[RQ_MAX_GROUPS][8];
+float rq_rotors[RQ_MAX_GROUPS][8];
 static int rq_initialized = 0;
 
-static void rq_init(void) {
+void rq_init(void) {
     if (rq_initialized) return;
     for (int g = 0; g < RQ_MAX_GROUPS; g++) {
         rq_make_rotor(rq_rotors[g], RQ_SEED + g);
@@ -170,45 +170,58 @@ static void rq_init(void) {
     rq_initialized = 1;
 }
 
-/* ── Lloyd-Max codebooks for 4-bit (16 centroids) ──────────────────
+/* ── Lloyd-Max codebooks for 3-bit MSE (8 centroids) ─────────────
  * Generated via scipy for the Gaussian approximation N(0, 1/d).
+ * Used in RotorQuantProd: 3-bit MSE + 1-bit QJL = 4-bit total.
  */
-#define RQ_N_LEVELS 16
+#define RQ_MSE_LEVELS 8
 
-static const float rq_centroids_d64[16] = {
-    -0.3416347612f, -0.2586961384f, -0.2023261788f, -0.1570952221f,
-    -0.1178499334f, -0.0821391425f, -0.0485339480f, -0.0160589141f,
-     0.0160589141f,  0.0485339480f,  0.0821391425f,  0.1178499334f,
-     0.1570952221f,  0.2023261788f,  0.2586961384f,  0.3416347612f,
+const float rq3_centroids_d64[8] = {
+    -0.2689932131f, -0.1679886598f, -0.0945006602f, -0.0306367724f,
+     0.0306367724f,  0.0945006602f,  0.1679886598f,  0.2689932131f,
 };
-static const float rq_centroids_d128[16] = {
-    -0.2415722564f, -0.1829257937f, -0.1430662130f, -0.1110830968f,
-    -0.0833324871f, -0.0580811446f, -0.0343186837f, -0.0113553670f,
-     0.0113553670f,  0.0343186837f,  0.0580811446f,  0.0833324871f,
-     0.1110830968f,  0.1430662130f,  0.1829257937f,  0.2415722564f,
+const float rq3_centroids_d128[8] = {
+    -0.1902069251f, -0.1187859205f, -0.0668220576f, -0.0216634695f,
+     0.0216634695f,  0.0668220576f,  0.1187859205f,  0.1902069251f,
 };
-static const float rq_centroids_d256[16] = {
-    -0.1708173806f, -0.1293480692f, -0.1011630894f, -0.0785476111f,
-    -0.0589249667f, -0.0410695712f, -0.0242669740f, -0.0080294570f,
-     0.0080294570f,  0.0242669740f,  0.0410695712f,  0.0589249667f,
-     0.0785476111f,  0.1011630894f,  0.1293480692f,  0.1708173806f,
+const float rq3_centroids_d256[8] = {
+    -0.1344966065f, -0.0839943299f, -0.0472503301f, -0.0153183862f,
+     0.0153183862f,  0.0472503301f,  0.0839943299f,  0.1344966065f,
 };
 
 static const float * rq_get_centroids(int d) {
-    if (d <= 64)  return rq_centroids_d64;
-    if (d <= 128) return rq_centroids_d128;
-    return rq_centroids_d256;
+    if (d <= 64)  return rq3_centroids_d64;
+    if (d <= 128) return rq3_centroids_d128;
+    return rq3_centroids_d256;
 }
 
 static int rq_nearest_centroid(float val, const float * centroids) {
     int best = 0;
     float best_d = fabsf(val - centroids[0]);
-    for (int i = 1; i < RQ_N_LEVELS; i++) {
+    for (int i = 1; i < RQ_MSE_LEVELS; i++) {
         float d = fabsf(val - centroids[i]);
         if (d < best_d) { best_d = d; best = i; }
     }
     return best;
 }
+
+/* ── QJL S matrix (128×128 Gaussian, shared across layers) ────────*/
+#define RQ_QJL_SEED 43  /* different from rotor seed */
+float rq_S[RQ_MAX_D][RQ_MAX_D];
+static int rq_S_initialized = 0;
+
+void rq_init_S(int d) {
+    if (rq_S_initialized) return;
+    rq_prng_seed(RQ_QJL_SEED);
+    for (int i = 0; i < d; i++) {
+        for (int j = 0; j < d; j++) {
+            rq_S[i][j] = (float)rq_prng_normal();
+        }
+    }
+    rq_S_initialized = 1;
+}
+
+#define RQ_QJL_SCALE(d) (sqrtf(M_PI / 2.0f) / (float)(d))
 
 /* ── Quantize ──────────────────────────────────────────────────────
  *
@@ -225,10 +238,12 @@ void quantize_row_rq4_128_ref(const float * GGML_RESTRICT x, block_rq4_128 * GGM
     assert(k % QK_RQ4_128 == 0);
     rq_init();
 
-    const int d = QK_RQ4_128;  /* head dimension from block size */
+    const int d = QK_RQ4_128;
     const int n_groups = (d + 2) / 3;
     const float * centroids = rq_get_centroids(d);
     const int nb = k / d;
+
+    rq_init_S(d);
 
     for (int block = 0; block < nb; block++) {
         const float * src = x + block * d;
@@ -242,7 +257,7 @@ void quantize_row_rq4_128_ref(const float * GGML_RESTRICT x, block_rq4_128 * GGM
         float grp_norm = sqrtf(norm_sq);
         float inv_norm = (grp_norm > 1e-10f) ? 1.0f / grp_norm : 0.0f;
 
-        /* 2. Pad to multiple of 3 */
+        /* 2. Pad unit vector */
         float x_padded[RQ_MAX_GROUPS * 3];
         for (int j = 0; j < d; j++) {
             x_padded[j] = src[j] * inv_norm;
@@ -251,11 +266,16 @@ void quantize_row_rq4_128_ref(const float * GGML_RESTRICT x, block_rq4_128 * GGM
             x_padded[j] = 0.0f;
         }
 
-        memset(blk->qs, 0, sizeof(blk->qs));
+        memset(blk->qs_lo, 0, sizeof(blk->qs_lo));
+        memset(blk->qs_hi, 0, sizeof(blk->qs_hi));
+        memset(blk->qjl, 0, sizeof(blk->qjl));
+
+        /* 3. Stage 1: Per-group rotor rotation + 3-bit MSE quantization */
+        float x_mse[RQ_MAX_D]; /* MSE reconstruction (unit sphere) */
+        memset(x_mse, 0, sizeof(float) * d);
         float recon_sq = 0.0f;
         int idx_pos = 0;
 
-        /* 3. Per-group rotation + quantization */
         for (int g = 0; g < n_groups; g++) {
             float mv[8] = {0};
             mv[1] = x_padded[g*3 + 0];
@@ -265,28 +285,64 @@ void quantize_row_rq4_128_ref(const float * GGML_RESTRICT x, block_rq4_128 * GGM
             float mv_rot[8];
             cl3_rotor_sandwich(rq_rotors[g], mv, mv_rot);
 
+            /* Quantize + store 3-bit index as 2-bit low + 1-bit high */
             for (int c = 0; c < 3; c++) {
                 int idx = rq_nearest_centroid(mv_rot[1 + c], centroids);
-                if (idx_pos % 2 == 0) {
-                    blk->qs[idx_pos / 2] = (uint8_t)(idx & 0x0F);
-                } else {
-                    blk->qs[idx_pos / 2] |= (uint8_t)((idx & 0x0F) << 4);
+                /* 2-bit low */
+                blk->qs_lo[idx_pos / 4] |= (uint8_t)((idx & 0x3) << ((idx_pos % 4) * 2));
+                /* 1-bit high */
+                if (idx & 0x4) {
+                    blk->qs_hi[idx_pos / 8] |= (uint8_t)(1 << (idx_pos % 8));
                 }
-                idx_pos++;
                 recon_sq += centroids[idx] * centroids[idx];
+
+                /* Reconstruct rotated value for residual computation */
+                mv_rot[1 + c] = centroids[idx];
+                idx_pos++;
             }
+
+            /* Inverse sandwich to get MSE reconstruction in original space */
+            float mv_recon[8];
+            cl3_rotor_sandwich_inverse(rq_rotors[g], mv_rot, mv_recon);
+            int base = g * 3;
+            if (base + 0 < d) { x_mse[base + 0] = mv_recon[1]; }
+            if (base + 1 < d) { x_mse[base + 1] = mv_recon[2]; }
+            if (base + 2 < d) { x_mse[base + 2] = mv_recon[3]; }
         }
 
-        /* 4. Corrected norm */
+        /* Corrected norm for MSE component */
         float recon_norm = sqrtf(recon_sq);
         float corrected = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
         blk->norm = GGML_FP32_TO_FP16(corrected);
+
+        /* 4. Stage 2: QJL on residual */
+        /* Residual = original - MSE reconstruction (in original space) */
+        float residual[RQ_MAX_D];
+        float res_sq = 0.0f;
+        for (int j = 0; j < d; j++) {
+            residual[j] = src[j] - x_mse[j] * corrected;
+            res_sq += residual[j] * residual[j];
+        }
+        float res_norm = sqrtf(res_sq);
+        blk->resnorm = GGML_FP32_TO_FP16(res_norm);
+
+        /* QJL: sign(S × residual) */
+        for (int i = 0; i < d; i++) {
+            float proj = 0.0f;
+            for (int j = 0; j < d; j++) {
+                proj += rq_S[i][j] * residual[j];
+            }
+            if (proj >= 0.0f) {
+                blk->qjl[i / 8] |= (uint8_t)(1 << (i % 8));
+            }
+        }
     }
 }
 
 /* ── Dequantize ────────────────────────────────────────────────────
  *
- * Unpack indices → centroid lookup → inverse rotor sandwich → scale by norm
+ * Stage 1: Unpack 3-bit indices → centroid → inverse sandwich → scale by norm
+ * Stage 2: QJL correction: += (sqrt(pi/2)/d) × resnorm × S^T × signs
  */
 void dequantize_row_rq4_128(const block_rq4_128 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_RQ4_128 == 0);
@@ -296,22 +352,24 @@ void dequantize_row_rq4_128(const block_rq4_128 * GGML_RESTRICT x, float * GGML_
     const int n_groups = (d + 2) / 3;
     const float * centroids = rq_get_centroids(d);
     const int nb = k / d;
+    const float qjl_scale = RQ_QJL_SCALE(d);
+
+    rq_init_S(d);
 
     for (int block = 0; block < nb; block++) {
         float norm = GGML_FP16_TO_FP32(x[block].norm);
-        int idx_pos = 0;
+        float resnorm = GGML_FP16_TO_FP32(x[block].resnorm);
 
+        /* Stage 1: MSE reconstruction */
+        int idx_pos = 0;
         for (int g = 0; g < n_groups; g++) {
             float mv_rot[8] = {0};
             for (int c = 0; c < 3; c++) {
-                uint8_t packed;
-                if (idx_pos % 2 == 0) {
-                    packed = x[block].qs[idx_pos / 2] & 0x0F;
-                } else {
-                    packed = (x[block].qs[idx_pos / 2] >> 4) & 0x0F;
-                }
+                uint8_t lo = (x[block].qs_lo[idx_pos / 4] >> ((idx_pos % 4) * 2)) & 0x3;
+                uint8_t hi = (x[block].qs_hi[idx_pos / 8] >> (idx_pos % 8)) & 0x1;
+                uint8_t idx = lo | (hi << 2);
+                mv_rot[1 + c] = centroids[idx];
                 idx_pos++;
-                mv_rot[1 + c] = centroids[packed];
             }
 
             float mv_recon[8];
@@ -321,6 +379,20 @@ void dequantize_row_rq4_128(const block_rq4_128 * GGML_RESTRICT x, float * GGML_
             if (g * 3 + 0 < d) { y[base + 0] = mv_recon[1] * norm; }
             if (g * 3 + 1 < d) { y[base + 1] = mv_recon[2] * norm; }
             if (g * 3 + 2 < d) { y[base + 2] = mv_recon[3] * norm; }
+        }
+
+        /* Stage 2: QJL correction */
+        if (resnorm > 1e-10f) {
+            float scale = qjl_scale * resnorm;
+            int base = block * d;
+            for (int j = 0; j < d; j++) {
+                float correction = 0.0f;
+                for (int i = 0; i < d; i++) {
+                    float sign = (x[block].qjl[i / 8] >> (i % 8)) & 1 ? 1.0f : -1.0f;
+                    correction += rq_S[i][j] * sign;  /* S^T × signs */
+                }
+                y[base + j] += scale * correction;
+            }
         }
     }
 }
