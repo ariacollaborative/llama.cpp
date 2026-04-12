@@ -4193,7 +4193,8 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 const bool is_f32_f16 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 &&
                                         v->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F32;
                 const bool is_rq4 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_RQ4_128 &&
-                                    v->type == GGML_TYPE_RQ4_128 && op->type == GGML_TYPE_F32;
+                                    v->type == GGML_TYPE_RQ4_128 && op->type == GGML_TYPE_F32 &&
+                                    q->ne[1] == 1;  /* q1 decode only — prefill falls back to CPU */
 
                 return is_f32_f32 || is_f16_f16 || is_f32_f16 || is_rq4;
             }
