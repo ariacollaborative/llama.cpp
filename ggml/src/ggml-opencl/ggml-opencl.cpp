@@ -430,6 +430,9 @@ struct ggml_backend_opencl_context {
     cl_program program_mul_mv_tq3_f32;
     cl_mem tq3_signs_128, tq3_signs_256;
     cl_mem tq3_s_transpose_128, tq3_s_transpose_256;
+    cl_program program_set_rows_rq4;
+    cl_program program_mul_mv_rq4_f32;
+    cl_mem rq4_rotors;
     cl_program program_glu;
     cl_program program_im2col_f16;
     cl_program program_im2col_f32;
@@ -522,6 +525,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_set_rows_f32_i64, kernel_set_rows_f32_i32, kernel_set_rows_f16_i64, kernel_set_rows_f16_i32;
     cl_kernel kernel_set_rows_tq3_128_i64, kernel_set_rows_tq3_128_i32;
     cl_kernel kernel_mul_mv_tq3_128_f32;
+    cl_kernel kernel_set_rows_rq4_128;
+    cl_kernel kernel_mul_mv_rq4_128_f32;
     cl_kernel kernel_rope_norm_f32, kernel_rope_norm_f16, kernel_rope_neox_f32, kernel_rope_neox_f16;
     cl_kernel kernel_rope_multi_f32, kernel_rope_multi_f16, kernel_rope_vision_f32, kernel_rope_vision_f16;
     cl_kernel kernel_cpy_f16_f16, kernel_cpy_f16_f32, kernel_cpy_f32_f16, kernel_cpy_f32_f32, kernel_cpy_i32_i32;
@@ -2326,6 +2331,69 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         GGML_LOG_CONT(".");
     }
 
+    // RQ4 kernels + rotor buffer
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string rq4_sr_src {
+            #include "set_rows_rq4.cl.h"
+        };
+        const std::string rq4_mv_src {
+            #include "mul_mv_rq4_f32.cl.h"
+        };
+#else
+        const std::string rq4_sr_src = read_file("set_rows_rq4.cl");
+        const std::string rq4_mv_src = read_file("mul_mv_rq4_f32.cl");
+#endif
+        backend_ctx->program_set_rows_rq4 =
+            build_program_from_source(backend_ctx->context, backend_ctx->device, rq4_sr_src.c_str(), compile_opts);
+        CL_CHECK((backend_ctx->kernel_set_rows_rq4_128 = clCreateKernel(backend_ctx->program_set_rows_rq4, "kernel_set_rows_rq4", &err), err));
+        backend_ctx->program_mul_mv_rq4_f32 =
+            build_program_from_source(backend_ctx->context, backend_ctx->device, rq4_mv_src.c_str(), compile_opts);
+        CL_CHECK((backend_ctx->kernel_mul_mv_rq4_128_f32 = clCreateKernel(backend_ctx->program_mul_mv_rq4_f32, "kernel_mul_mv_rq4_f32", &err), err));
+
+        // Generate rotor buffer: 43 groups × 4 floats [s, b12, b13, b23]
+        // Same algorithm as CPU rq_make_rotor() in ggml-rotorquant.c
+        // PRNG: LCG with multiplier 6364136223846793005, addend 1442695040888963407
+        auto rq_prng_next = [](uint64_t &state) -> double {
+            state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+            return (double)(state >> 11) / (double)(1ULL << 53);
+        };
+        auto rq_prng_normal = [&](uint64_t &state) -> double {
+            double u1 = rq_prng_next(state);
+            if (u1 < 1e-15) u1 = 1e-15;
+            double u2 = rq_prng_next(state);
+            return sqrt(-2.0 * log(u1)) * cos(6.283185307179586 * u2);
+        };
+
+        const int RQ_N_GROUPS = 43;
+        const int RQ_SEED_BASE = 42;
+        std::vector<float> rotors(RQ_N_GROUPS * 4);
+        for (int g = 0; g < RQ_N_GROUPS; g++) {
+            uint64_t state = (uint64_t)(RQ_SEED_BASE + g);
+            float bv[3];
+            bv[0] = (float)rq_prng_normal(state);
+            bv[1] = (float)rq_prng_normal(state);
+            bv[2] = (float)rq_prng_normal(state);
+            float bv_norm = sqrtf(bv[0]*bv[0] + bv[1]*bv[1] + bv[2]*bv[2]);
+            if (bv_norm < 1e-8f) bv_norm = 1e-8f;
+            bv[0] /= bv_norm; bv[1] /= bv_norm; bv[2] /= bv_norm;
+            float angle = (float)(rq_prng_next(state) * 6.283185307179586);
+            float half = angle * 0.5f;
+            float c = cosf(half);
+            float s = sinf(half);
+            float r0 = c, r4 = s*bv[0], r5 = s*bv[1], r6 = s*bv[2];
+            float inv = 1.0f / sqrtf(r0*r0 + r4*r4 + r5*r5 + r6*r6);
+            rotors[g*4 + 0] = r0 * inv;  /* s   */
+            rotors[g*4 + 1] = r4 * inv;  /* b12 */
+            rotors[g*4 + 2] = r5 * inv;  /* b13 */
+            rotors[g*4 + 3] = r6 * inv;  /* b23 */
+        }
+        backend_ctx->rq4_rotors = clCreateBuffer(backend_ctx->context, CL_MEM_READ_ONLY|CL_MEM_COPY_HOST_PTR,
+                                                  RQ_N_GROUPS * 4 * sizeof(float), rotors.data(), &err);
+        CL_CHECK(err);
+        GGML_LOG_CONT(".");
+    }
+
      // conv2d
      {
         #ifdef GGML_OPENCL_EMBED_KERNELS
@@ -3862,6 +3930,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     case GGML_TYPE_F16:
                     case GGML_TYPE_F32:
                     case GGML_TYPE_TQ3_128:
+                    case GGML_TYPE_RQ4_128:
                         return (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
                     default:
                         return false;
@@ -4009,6 +4078,8 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             } else if (op->src[0]->type == GGML_TYPE_Q8_0) {
                 return op->src[1]->type == GGML_TYPE_F32;
             } else if (op->src[0]->type == GGML_TYPE_TQ3_128) {
+                return op->src[1]->type == GGML_TYPE_F32;
+            } else if (op->src[0]->type == GGML_TYPE_RQ4_128) {
                 return op->src[1]->type == GGML_TYPE_F32;
             }
             return false;
@@ -6442,6 +6513,34 @@ static void ggml_cl_set_rows(ggml_backend_t backend, const ggml_tensor * src0, c
     cl_ulong offset0 = extra0->offset + src0->view_offs;
     cl_ulong offset1 = extra1->offset + src1->view_offs;
     cl_ulong offsetd = extrad->offset + dst->view_offs;
+
+    // RQ4 has a different kernel signature — dispatch early and return
+    if (dst->type == GGML_TYPE_RQ4_128) {
+        cl_kernel rq4_kernel = backend_ctx->kernel_set_rows_rq4_128;
+        const int ne00 = src0->ne[0];
+        const int ne10 = src1->ne[0];
+        const int ne11 = src1->ne[1];
+        const int ne12 = src1->ne[2];
+        // nb1/nb2/nb3 are dst strides
+        const cl_long rq4_nb1 = (cl_long)dst->nb[1];
+        const cl_long rq4_nb2 = (cl_long)dst->nb[2];
+        const cl_long rq4_nb3 = (cl_long)dst->nb[3];
+        CL_CHECK(clSetKernelArg(rq4_kernel,  0, sizeof(cl_mem),  &extra0->data_device));
+        CL_CHECK(clSetKernelArg(rq4_kernel,  1, sizeof(cl_mem),  &extra1->data_device));
+        CL_CHECK(clSetKernelArg(rq4_kernel,  2, sizeof(cl_mem),  &extrad->data_device));
+        CL_CHECK(clSetKernelArg(rq4_kernel,  3, sizeof(int),     &ne00));
+        CL_CHECK(clSetKernelArg(rq4_kernel,  4, sizeof(cl_long), &rq4_nb1));
+        CL_CHECK(clSetKernelArg(rq4_kernel,  5, sizeof(cl_long), &rq4_nb2));
+        CL_CHECK(clSetKernelArg(rq4_kernel,  6, sizeof(cl_long), &rq4_nb3));
+        CL_CHECK(clSetKernelArg(rq4_kernel,  7, sizeof(int),     &ne10));
+        CL_CHECK(clSetKernelArg(rq4_kernel,  8, sizeof(int),     &ne11));
+        CL_CHECK(clSetKernelArg(rq4_kernel,  9, sizeof(int),     &ne12));
+        CL_CHECK(clSetKernelArg(rq4_kernel, 10, sizeof(cl_mem),  &backend_ctx->rq4_rotors));
+        size_t rq4_global[] = {(size_t)ne10, (size_t)ne11, (size_t)ne12};
+        size_t rq4_local[]  = {1, 1, 1};
+        backend_ctx->enqueue_ndrange_kernel(rq4_kernel, 3, rq4_global, rq4_local, dst);
+        return;
+    }
 
     cl_kernel kernel;
 
@@ -11078,6 +11177,40 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
                 return;
             }
+            case GGML_TYPE_RQ4_128: {
+                kernel = backend_ctx->kernel_mul_mv_rq4_128_f32;
+                nth0 = 1;
+                nth1 = 1;
+                ndst = 1;
+                {
+                cl_ulong nb01_ = src0->nb[1], nb02_ = src0->nb[2], nb03_ = src0->nb[3];
+                cl_ulong nb11_ = src1->nb[1], nb12_ = src1->nb[2], nb13_ = src1->nb[3];
+                CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
+                CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
+                CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra1->data_device));
+                CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
+                CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extrad->data_device));
+                CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offsetd));
+                CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &ne00));
+                CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &ne01));
+                CL_CHECK(clSetKernelArg(kernel,  8, sizeof(cl_ulong), &nb01_));
+                CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_ulong), &nb02_));
+                CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_ulong), &nb03_));
+                CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &ne12));
+                CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_ulong), &nb11_));
+                CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_ulong), &nb12_));
+                CL_CHECK(clSetKernelArg(kernel, 14, sizeof(cl_ulong), &nb13_));
+                CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &ne0));
+                CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &ne1));
+                CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &r2));
+                CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &r3));
+                CL_CHECK(clSetKernelArg(kernel, 19, sizeof(cl_mem),   &backend_ctx->rq4_rotors));
+                }
+                size_t global_work_size[] = {(size_t)ne01, (size_t)ne11, (size_t)ne12*ne13};
+                size_t local_work_size[] = {1, 1, 1};
+                backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+                return;
+            }
             default:
                 break;
         }
@@ -11728,6 +11861,45 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             CL_CHECK(clSetKernelArg(kernel, 20, sizeof(cl_mem), &backend_ctx->tq3_s_transpose_128));
             }
             // Work sizes: same as q8_0 but no subgroups
+            size_t global_work_size[] = {(size_t)ne01, (size_t)ne11, (size_t)ne12*ne13};
+            size_t local_work_size[] = {1, 1, 1};
+            backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+            return;
+        }
+        case GGML_TYPE_RQ4_128: {
+            kernel = backend_ctx->kernel_mul_mv_rq4_128_f32;
+            nth0 = 1;
+            nth1 = 1;
+            ndst = 1;
+            {
+            cl_ulong nb01 = src0->nb[1];
+            cl_ulong nb02 = src0->nb[2];
+            cl_ulong nb03 = src0->nb[3];
+            cl_ulong nb11 = src1->nb[1];
+            cl_ulong nb12 = src1->nb[2];
+            cl_ulong nb13 = src1->nb[3];
+            CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
+            CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
+            CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra1->data_device));
+            CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
+            CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extrad->data_device));
+            CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offsetd));
+            CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &ne00));
+            CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &ne01));
+            CL_CHECK(clSetKernelArg(kernel,  8, sizeof(cl_ulong), &nb01));
+            CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_ulong), &nb02));
+            CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_ulong), &nb03));
+            CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &ne12));
+            CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_ulong), &nb11));
+            CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_ulong), &nb12));
+            CL_CHECK(clSetKernelArg(kernel, 14, sizeof(cl_ulong), &nb13));
+            CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &ne0));
+            CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &ne1));
+            CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &r2));
+            CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &r3));
+            CL_CHECK(clSetKernelArg(kernel, 19, sizeof(cl_mem),   &backend_ctx->rq4_rotors));
+            }
+            // Work sizes: one work item per key row
             size_t global_work_size[] = {(size_t)ne01, (size_t)ne11, (size_t)ne12*ne13};
             size_t local_work_size[] = {1, 1, 1};
             backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
