@@ -205,6 +205,23 @@ typedef pthread_t ggml_thread_t;
 #include <TargetConditionals.h>
 #endif
 
+// RotorQuant vec_dot: dequantize rq4 block to f32, then dot with f32 query.
+static void ggml_vec_dot_rq4_128_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                      const void * GGML_RESTRICT vx, size_t bx,
+                                      const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(nrc == 1);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+    float tmp[4096];
+    GGML_ASSERT(n <= 4096);
+    dequantize_row_rq4_128((const block_rq4_128 *)vx, tmp, n);
+    const float * y = (const float *)vy;
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        sum += tmp[i] * y[i];
+    }
+    *s = sum;
+}
+
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_fp32,
@@ -408,6 +425,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     },
     [GGML_TYPE_TQ4_Q_128] = {
         .from_float   = (ggml_from_float_t) from_float_tq4_q_128,
+    },
+    [GGML_TYPE_RQ4_128] = {
+        .from_float   = (ggml_from_float_t) quantize_row_rq4_128_ref,
+        .vec_dot      = (ggml_vec_dot_t) ggml_vec_dot_rq4_128_f32,
+        .vec_dot_type = GGML_TYPE_F32,
+        .nrows        = 1,
     },
     [GGML_TYPE_I32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,

@@ -101,6 +101,11 @@ void ggml_vec_dot_tq3_q_128(int n, float * GGML_RESTRICT s, size_t bs, const voi
 void ggml_vec_dot_tq4_q_128(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 size_t quantize_tq3_128(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 
+// RotorQuant
+void quantize_row_rq4_128_ref(const float * GGML_RESTRICT x, block_rq4_128 * GGML_RESTRICT y, int64_t k);
+void dequantize_row_rq4_128(const block_rq4_128 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+size_t quantize_rq4_128(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+
 GGML_API size_t quantize_q2_K(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 GGML_API size_t quantize_q3_K(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 GGML_API size_t quantize_q4_K(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);

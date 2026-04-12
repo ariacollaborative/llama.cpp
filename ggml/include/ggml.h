@@ -432,7 +432,8 @@ extern "C" {
         GGML_TYPE_TQ4_128   = 42, // TurboQuant b=4, 3.5-bit mixed precision
         GGML_TYPE_TQ3_Q_128 = 43, // TurboQuant query block (32/96 split)
         GGML_TYPE_TQ4_Q_128 = 44, // TurboQuant query block (64/64 split)
-        GGML_TYPE_COUNT     = 45,
+        GGML_TYPE_RQ4_128   = 45, // RotorQuant 4-bit: Cl(3,0) rotor + Lloyd-Max
+        GGML_TYPE_COUNT     = 46,
     };
 
     // precision
