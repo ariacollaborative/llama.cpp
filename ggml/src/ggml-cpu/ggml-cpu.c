@@ -205,96 +205,21 @@ typedef pthread_t ggml_thread_t;
 #include <TargetConditionals.h>
 #endif
 
-// RotorQuant vec_dot: fused MSE dot + QJL correction
-// Caches S×query projection — recomputed only when query pointer changes.
-// Paper formula: <y,x> ≈ <y, x_mse> + (√(π/2)/d) × resnorm × <S×y, signs>
-static _Thread_local const float * rq_cached_query_ptr = NULL;
-static _Thread_local float rq_cached_q_proj[256];
-
-extern float rq_S[256][256];  /* from ggml-rotorquant.c */
-extern float rq_rotors[][8];
-extern void rq_init(void);
-extern void rq_init_S(int d);
-
+// RotorQuant vec_dot: dequantize rq4 block to f32, then dot with f32 query.
 static void ggml_vec_dot_rq4_128_f32(int n, float * GGML_RESTRICT s, size_t bs,
                                       const void * GGML_RESTRICT vx, size_t bx,
                                       const void * GGML_RESTRICT vy, size_t by, int nrc) {
     GGML_ASSERT(nrc == 1);
     GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
-    GGML_ASSERT(n <= 256);
-
-    rq_init();
-    rq_init_S(n);
-
-    const block_rq4_128 * blk = (const block_rq4_128 *)vx;
-    const float * query = (const float *)vy;
-    const int d = n;
-    const int n_groups = (d + 2) / 3;
-
-    /* Compute S × query (O(d²) per call — no cache, buffer reuse breaks pointer check) */
-    float q_proj[256];
-    for (int i = 0; i < d; i++) {
-        float sum = 0.0f;
-        for (int j = 0; j < d; j++) {
-            sum += rq_S[i][j] * query[j];
-        }
-        q_proj[i] = sum;
+    float tmp[4096];
+    GGML_ASSERT(n <= 4096);
+    dequantize_row_rq4_128((const block_rq4_128 *)vx, tmp, n);
+    const float * y = (const float *)vy;
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        sum += tmp[i] * y[i];
     }
-
-    /* Get centroids for this dimension */
-    const float * centroids;
-    if (d <= 64) {
-        extern const float rq3_centroids_d64[8];
-        centroids = rq3_centroids_d64;
-    } else if (d <= 128) {
-        extern const float rq3_centroids_d128[8];
-        centroids = rq3_centroids_d128;
-    } else {
-        extern const float rq3_centroids_d256[8];
-        centroids = rq3_centroids_d256;
-    }
-
-    float norm = GGML_FP16_TO_FP32(blk->norm);
-    float resnorm = GGML_FP16_TO_FP32(blk->resnorm);
-
-    /* Stage 1: MSE dot product (dequant rotor + dot with query) */
-    float mse_sum = 0.0f;
-    int idx_pos = 0;
-    for (int g = 0; g < n_groups; g++) {
-        float mv_rot[8] = {0};
-        for (int c = 0; c < 3; c++) {
-            uint8_t lo = (blk->qs_lo[idx_pos / 4] >> ((idx_pos % 4) * 2)) & 0x3;
-            uint8_t hi = (blk->qs_hi[idx_pos / 8] >> (idx_pos % 8)) & 0x1;
-            mv_rot[1 + c] = centroids[lo | (hi << 2)];
-            idx_pos++;
-        }
-
-        /* Inverse rotor sandwich */
-        float rotor_rev[8], temp[8], mv_recon[8];
-        extern void cl3_reverse(const float x[8], float r[8]);
-        extern void cl3_geometric_product(const float a[8], const float b[8], float r[8]);
-        cl3_reverse(rq_rotors[g], rotor_rev);
-        cl3_geometric_product(rotor_rev, mv_rot, temp);
-        cl3_geometric_product(temp, rq_rotors[g], mv_recon);
-
-        int base = g * 3;
-        if (base + 0 < d) { mse_sum += mv_recon[1] * query[base + 0]; }
-        if (base + 1 < d) { mse_sum += mv_recon[2] * query[base + 1]; }
-        if (base + 2 < d) { mse_sum += mv_recon[3] * query[base + 2]; }
-    }
-    mse_sum *= norm;
-
-    /* Stage 2: QJL correction = (√(π/2)/d) × resnorm × <S×query, signs> */
-    float qjl_sum = 0.0f;
-    if (resnorm > 1e-10f) {
-        for (int i = 0; i < d; i++) {
-            float sign = (blk->qjl[i / 8] >> (i % 8)) & 1 ? 1.0f : -1.0f;
-            qjl_sum += q_proj[i] * sign;
-        }
-        qjl_sum *= sqrtf(M_PI / 2.0f) / (float)d * resnorm;
-    }
-
-    *s = mse_sum + qjl_sum;
+    *s = sum;
 }
 
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {

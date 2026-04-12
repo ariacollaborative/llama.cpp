@@ -320,18 +320,15 @@ typedef struct {
 } block_tq3_q_128;
 static_assert(sizeof(block_tq3_q_128) == 1152, "wrong tq3_q_128 block size");
 
-// RotorQuant 4-bit: Clifford Cl(3,0) rotor sandwich + 3-bit MSE + 1-bit QJL
-// 43 groups of 3 dims, 3 quantized vector components per group = 129 values
-// 3-bit index = 2-bit low (qs_lo) + 1-bit high (qs_hi), plus 1-bit QJL signs
+// RotorQuant 4-bit: Clifford Cl(3,0) rotor sandwich + 4-bit Lloyd-Max MSE
+// 43 groups of 3 dims, 3 quantized vector components per group = 129 nibbles
+// Corrected geometric product: zero trivector leakage, grade-1 preserved
 #define QK_RQ4_128  128
 typedef struct {
     ggml_half norm;                   //  2 bytes: corrected L2 norm
-    ggml_half resnorm;                //  2 bytes: residual L2 norm for QJL
-    uint8_t   qs_lo[34];              // 34 bytes: 129 x 2-bit low indices (4 per byte) + padding
-    uint8_t   qs_hi[18];              // 18 bytes: 129 x 1-bit high indices (8 per bit) + padding
-    uint8_t   qjl[16];               // 16 bytes: 128 x 1-bit QJL signs
-} block_rq4_128;                      // 72 bytes total = 4.5 bpv
-static_assert(sizeof(block_rq4_128) == 72, "wrong rq4_128 block size");
+    uint8_t   qs[66];                 // 66 bytes: 129 x 4-bit indices + padding
+} block_rq4_128;                      // 68 bytes total = 4.25 bpv
+static_assert(sizeof(block_rq4_128) == 68, "wrong rq4_128 block size");
 
 //
 // Super-block quantization structures
