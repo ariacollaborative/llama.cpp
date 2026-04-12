@@ -19,8 +19,8 @@
 #include <assert.h>
 #include <stdint.h>
 
-#define RQ_D       128
-#define RQ_N_GROUPS 43   /* ceil(128/3) */
+#define RQ_MAX_D    256
+#define RQ_MAX_GROUPS ((RQ_MAX_D + 2) / 3)  /* ceil(256/3) = 86 */
 #define RQ_SEED    42
 
 /* ── Cl(3,0) geometric product ──────────────────────────────────────
@@ -158,35 +158,53 @@ static void rq_make_rotor(float rotor[8], int seed) {
     rotor[6] *= inv;
 }
 
-/* ── Static rotor storage (43 rotors, generated once) ──────────────*/
-static float rq_rotors[RQ_N_GROUPS][8];
+/* ── Static rotor storage (max 86 rotors for d=256, generated once) ─*/
+static float rq_rotors[RQ_MAX_GROUPS][8];
 static int rq_initialized = 0;
 
 static void rq_init(void) {
     if (rq_initialized) return;
-    for (int g = 0; g < RQ_N_GROUPS; g++) {
+    for (int g = 0; g < RQ_MAX_GROUPS; g++) {
         rq_make_rotor(rq_rotors[g], RQ_SEED + g);
     }
     rq_initialized = 1;
 }
 
-/* ── Lloyd-Max codebook for d=128, 4-bit (16 centroids) ────────────
- * Generated via scipy numerical integration of the Gaussian
- * approximation N(0, 1/d) to the Beta distribution on the sphere.
+/* ── Lloyd-Max codebooks for 4-bit (16 centroids) ──────────────────
+ * Generated via scipy for the Gaussian approximation N(0, 1/d).
  */
-static const int RQ_N_LEVELS = 16;
-static const float RQ_CENTROIDS_4BIT[16] = {
+#define RQ_N_LEVELS 16
+
+static const float rq_centroids_d64[16] = {
+    -0.3416347612f, -0.2586961384f, -0.2023261788f, -0.1570952221f,
+    -0.1178499334f, -0.0821391425f, -0.0485339480f, -0.0160589141f,
+     0.0160589141f,  0.0485339480f,  0.0821391425f,  0.1178499334f,
+     0.1570952221f,  0.2023261788f,  0.2586961384f,  0.3416347612f,
+};
+static const float rq_centroids_d128[16] = {
     -0.2415722564f, -0.1829257937f, -0.1430662130f, -0.1110830968f,
     -0.0833324871f, -0.0580811446f, -0.0343186837f, -0.0113553670f,
      0.0113553670f,  0.0343186837f,  0.0580811446f,  0.0833324871f,
      0.1110830968f,  0.1430662130f,  0.1829257937f,  0.2415722564f,
 };
+static const float rq_centroids_d256[16] = {
+    -0.1708173806f, -0.1293480692f, -0.1011630894f, -0.0785476111f,
+    -0.0589249667f, -0.0410695712f, -0.0242669740f, -0.0080294570f,
+     0.0080294570f,  0.0242669740f,  0.0410695712f,  0.0589249667f,
+     0.0785476111f,  0.1011630894f,  0.1293480692f,  0.1708173806f,
+};
 
-static int rq_nearest_centroid(float val) {
+static const float * rq_get_centroids(int d) {
+    if (d <= 64)  return rq_centroids_d64;
+    if (d <= 128) return rq_centroids_d128;
+    return rq_centroids_d256;
+}
+
+static int rq_nearest_centroid(float val, const float * centroids) {
     int best = 0;
-    float best_d = fabsf(val - RQ_CENTROIDS_4BIT[0]);
+    float best_d = fabsf(val - centroids[0]);
     for (int i = 1; i < RQ_N_LEVELS; i++) {
-        float d = fabsf(val - RQ_CENTROIDS_4BIT[i]);
+        float d = fabsf(val - centroids[i]);
         if (d < best_d) { best_d = d; best = i; }
     }
     return best;
@@ -207,26 +225,29 @@ void quantize_row_rq4_128_ref(const float * GGML_RESTRICT x, block_rq4_128 * GGM
     assert(k % QK_RQ4_128 == 0);
     rq_init();
 
-    const int nb = k / QK_RQ4_128;
+    const int d = QK_RQ4_128;  /* head dimension from block size */
+    const int n_groups = (d + 2) / 3;
+    const float * centroids = rq_get_centroids(d);
+    const int nb = k / d;
 
     for (int block = 0; block < nb; block++) {
-        const float * src = x + block * QK_RQ4_128;
+        const float * src = x + block * d;
         block_rq4_128 * blk = &y[block];
 
         /* 1. L2 norm */
         float norm_sq = 0.0f;
-        for (int j = 0; j < RQ_D; j++) {
+        for (int j = 0; j < d; j++) {
             norm_sq += src[j] * src[j];
         }
         float grp_norm = sqrtf(norm_sq);
         float inv_norm = (grp_norm > 1e-10f) ? 1.0f / grp_norm : 0.0f;
 
-        /* 2. Pad to 129 */
-        float x_padded[RQ_N_GROUPS * 3];
-        for (int j = 0; j < RQ_D; j++) {
+        /* 2. Pad to multiple of 3 */
+        float x_padded[RQ_MAX_GROUPS * 3];
+        for (int j = 0; j < d; j++) {
             x_padded[j] = src[j] * inv_norm;
         }
-        for (int j = RQ_D; j < RQ_N_GROUPS * 3; j++) {
+        for (int j = d; j < n_groups * 3; j++) {
             x_padded[j] = 0.0f;
         }
 
@@ -235,7 +256,7 @@ void quantize_row_rq4_128_ref(const float * GGML_RESTRICT x, block_rq4_128 * GGM
         int idx_pos = 0;
 
         /* 3. Per-group rotation + quantization */
-        for (int g = 0; g < RQ_N_GROUPS; g++) {
+        for (int g = 0; g < n_groups; g++) {
             float mv[8] = {0};
             mv[1] = x_padded[g*3 + 0];
             mv[2] = x_padded[g*3 + 1];
@@ -245,14 +266,14 @@ void quantize_row_rq4_128_ref(const float * GGML_RESTRICT x, block_rq4_128 * GGM
             cl3_rotor_sandwich(rq_rotors[g], mv, mv_rot);
 
             for (int c = 0; c < 3; c++) {
-                int idx = rq_nearest_centroid(mv_rot[1 + c]);
+                int idx = rq_nearest_centroid(mv_rot[1 + c], centroids);
                 if (idx_pos % 2 == 0) {
                     blk->qs[idx_pos / 2] = (uint8_t)(idx & 0x0F);
                 } else {
                     blk->qs[idx_pos / 2] |= (uint8_t)((idx & 0x0F) << 4);
                 }
                 idx_pos++;
-                recon_sq += RQ_CENTROIDS_4BIT[idx] * RQ_CENTROIDS_4BIT[idx];
+                recon_sq += centroids[idx] * centroids[idx];
             }
         }
 
@@ -271,13 +292,16 @@ void dequantize_row_rq4_128(const block_rq4_128 * GGML_RESTRICT x, float * GGML_
     assert(k % QK_RQ4_128 == 0);
     rq_init();
 
-    const int nb = k / QK_RQ4_128;
+    const int d = QK_RQ4_128;
+    const int n_groups = (d + 2) / 3;
+    const float * centroids = rq_get_centroids(d);
+    const int nb = k / d;
 
     for (int block = 0; block < nb; block++) {
         float norm = GGML_FP16_TO_FP32(x[block].norm);
         int idx_pos = 0;
 
-        for (int g = 0; g < RQ_N_GROUPS; g++) {
+        for (int g = 0; g < n_groups; g++) {
             float mv_rot[8] = {0};
             for (int c = 0; c < 3; c++) {
                 uint8_t packed;
@@ -287,16 +311,16 @@ void dequantize_row_rq4_128(const block_rq4_128 * GGML_RESTRICT x, float * GGML_
                     packed = (x[block].qs[idx_pos / 2] >> 4) & 0x0F;
                 }
                 idx_pos++;
-                mv_rot[1 + c] = RQ_CENTROIDS_4BIT[packed];
+                mv_rot[1 + c] = centroids[packed];
             }
 
             float mv_recon[8];
             cl3_rotor_sandwich_inverse(rq_rotors[g], mv_rot, mv_recon);
 
-            int base = block * QK_RQ4_128 + g * 3;
-            if (g * 3 + 0 < RQ_D) { y[base + 0] = mv_recon[1] * norm; }
-            if (g * 3 + 1 < RQ_D) { y[base + 1] = mv_recon[2] * norm; }
-            if (g * 3 + 2 < RQ_D) { y[base + 2] = mv_recon[3] * norm; }
+            int base = block * d + g * 3;
+            if (g * 3 + 0 < d) { y[base + 0] = mv_recon[1] * norm; }
+            if (g * 3 + 1 < d) { y[base + 1] = mv_recon[2] * norm; }
+            if (g * 3 + 2 < d) { y[base + 2] = mv_recon[3] * norm; }
         }
     }
 }
