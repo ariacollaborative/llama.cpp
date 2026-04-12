@@ -519,6 +519,7 @@ struct ggml_backend_opencl_context {
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q1;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16_q1;
+    std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_rq4_q1;
     std::map<std::pair<int, int>, int>       kernels_flash_attn_bm;
     std::map<std::pair<int, int>, int>       kernels_flash_attn_bn;
     cl_kernel kernel_get_rows_f32, kernel_get_rows_f16, kernel_get_rows_q4_0;
@@ -1856,6 +1857,24 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 
                 backend_ctx->kernels_flash_attn_bm[{dk, dv}] = bm;
                 backend_ctx->kernels_flash_attn_bn[{dk, dv}] = bn;
+
+                // RQ4 flash attention (q1 only for now)
+                if (dk == 128 && dv == 128) {
+                    #ifdef GGML_OPENCL_EMBED_KERNELS
+                    const std::string kernel_src_rq4 {
+                        #include "flash_attn_rq4.cl.h"
+                    };
+                    #else
+                    const std::string kernel_src_rq4 = read_file("flash_attn_rq4.cl");
+                    #endif
+                    if (!kernel_src_rq4.empty()) {
+                        cl_program prog_rq4 = build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_rq4.c_str(), compile_opts);
+                        cl_kernel k_rq4_q1;
+                        CL_CHECK((k_rq4_q1 = clCreateKernel(prog_rq4, "flash_attn_rq4_q1", &err), err));
+                        backend_ctx->kernels_flash_attn_rq4_q1[{dk, dv}] = k_rq4_q1;
+                        CL_CHECK(clReleaseProgram(prog_rq4));
+                    }
+                }
             }
             GGML_LOG_CONT(".");
         }
@@ -4173,8 +4192,10 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                                         v->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16;
                 const bool is_f32_f16 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 &&
                                         v->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F32;
+                const bool is_rq4 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_RQ4_128 &&
+                                    v->type == GGML_TYPE_RQ4_128 && op->type == GGML_TYPE_F32;
 
-                return is_f32_f32 || is_f16_f16 || is_f32_f16;
+                return is_f32_f32 || is_f16_f16 || is_f32_f16 || is_rq4;
             }
         default:
             return false;
@@ -9189,9 +9210,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
 
     const bool is_f16 = q->type == GGML_TYPE_F16;
     const bool is_mixed = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16;
+    const bool is_rq4 = k->type == GGML_TYPE_RQ4_128;
     const std::pair<int, int> dk_dv = {d_head_q, d_head_v};
 
-    if (n_q == 1) {
+    if (is_rq4 && n_q == 1) {
+        kernel = backend_ctx->kernels_flash_attn_rq4_q1.at(dk_dv);
+    } else if (n_q == 1) {
         if (is_mixed) {
             kernel = backend_ctx->kernels_flash_attn_f32_f16_q1.at(dk_dv);
         } else if (is_f16) {
